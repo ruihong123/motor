@@ -15,11 +15,20 @@ void SmallBank::LoadTable(node_id_t node_id,
                           size_t& ht_size,
                           size_t& initfv_size,
                           size_t& real_cvt_size) {
+  // Helper lambda to check if this node needs a table (primary or backup)
+  auto needsTable = [&](SmallBankTableType table_type) -> bool {
+    // IMPORTANT: Must allocate ALL tables on ALL nodes to ensure uniform memory layout.
+    // Replica writes use offsets from primary node, which must match backup node layout.
+    // Optimizing by skipping tables causes offset mismatches and data corruption.
+    return true;
+  };
+
   std::string config_filepath = "../../../config/smallbank_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
   auto table_config = json_config.get("smallbank");
 
-  {
+  // Only allocate and populate tables that this node needs
+  if (needsTable(SmallBankTableType::kSavingsTable)) {
     RDMA_LOG(DBG) << "Loading SAVINGS table";
     savings_table = new HashStore((table_id_t)SmallBankTableType::kSavingsTable,
                                   table_config.get("num_accounts").get_uint64(),
@@ -32,7 +41,7 @@ void SmallBank::LoadTable(node_id_t node_id,
     real_cvt_size += savings_table->GetLoadCVTSize();
   }
 
-  {
+  if (needsTable(SmallBankTableType::kCheckingTable)) {
     RDMA_LOG(DBG) << "Loading CHECKING table";
     checking_table = new HashStore((table_id_t)SmallBankTableType::kCheckingTable,
                                    table_config.get("num_accounts").get_uint64(),
@@ -47,30 +56,30 @@ void SmallBank::LoadTable(node_id_t node_id,
 
   std::cout << "----------------------------------------------------------" << std::endl;
 
-  // Assign primary
-  if ((node_id_t)SmallBankTableType::kSavingsTable % num_server == node_id) {
+  // Assign primary (only if table was allocated)
+  if (savings_table && (node_id_t)SmallBankTableType::kSavingsTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] SAVINGS table ID: " << (node_id_t)SmallBankTableType::kSavingsTable;
     std::cerr << "Number of initial records: " << std::dec << savings_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(savings_table);
   }
 
-  if ((node_id_t)SmallBankTableType::kCheckingTable % num_server == node_id) {
+  if (checking_table && (node_id_t)SmallBankTableType::kCheckingTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] CHECKING table ID: " << (node_id_t)SmallBankTableType::kCheckingTable;
     std::cerr << "Number of initial records: " << std::dec << checking_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(checking_table);
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign backup
+  // Assign backup (only if table was allocated)
   if (BACKUP_NUM < num_server) {
     for (node_id_t i = 1; i <= BACKUP_NUM; i++) {
-      if ((node_id_t)SmallBankTableType::kSavingsTable % num_server == (node_id - i + num_server) % num_server) {
+      if (savings_table && (node_id_t)SmallBankTableType::kSavingsTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] SAVINGS table ID: " << (node_id_t)SmallBankTableType::kSavingsTable;
         std::cerr << "Number of initial records: " << std::dec << savings_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(savings_table);
       }
 
-      if ((node_id_t)SmallBankTableType::kCheckingTable % num_server == (node_id - i + num_server) % num_server) {
+      if (checking_table && (node_id_t)SmallBankTableType::kCheckingTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] CHECKING table ID: " << (node_id_t)SmallBankTableType::kCheckingTable;
         std::cerr << "Number of initial records: " << std::dec << checking_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(checking_table);

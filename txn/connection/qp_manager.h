@@ -33,13 +33,24 @@ class QPManager {
       // Queue pair connection, exchange queue pair info via TCP
       ConnStatus rc;
       do {
-        rc = data_qp->connect(remote_node.ip, remote_node.port);
+        rc = data_qp->connect(remote_node.ip, remote_node.port, meta_man->local_machine_id);
         if (rc == SUCC) {
+          // Validate QP is actually in RTS state
+          struct ibv_qp_attr attr;
+          struct ibv_qp_init_attr init_attr;
+          if (ibv_query_qp(data_qp->qp_, &attr, IBV_QP_STATE, &init_attr) == 0) {
+            if (attr.qp_state != IBV_QPS_RTS) {
+              RDMA_LOG(ERROR) << "Thread " << global_tid << ": QP to node " << remote_node.node_id 
+                              << " not in RTS state! Current state: " << attr.qp_state;
+              rc = ERR;
+              continue;
+            }
+          }
+          
           // Bind the hash mr as the default remote mr for convenient parameter passing
           data_qp->bind_remote_mr(remote_hash_mr);
 
           data_qps[remote_node.node_id] = data_qp;
-          // RDMA_LOG(INFO) << "Thread " << global_tid << ": Data QP connected! with remote node: " << remote_node.node_id << " ip: " << remote_node.ip;
         }
         usleep(2000);
       } while (rc != SUCC);

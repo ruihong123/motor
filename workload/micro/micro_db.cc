@@ -15,8 +15,17 @@ void MICRO::LoadTable(node_id_t node_id,
                       size_t& ht_size,
                       size_t& initfv_size,
                       size_t& real_cvt_size) {
+  // Helper lambda to check if this node needs a table (primary or backup)
+  auto needsTable = [&](MicroTableType table_type) -> bool {
+    // IMPORTANT: Must allocate ALL tables on ALL nodes to ensure uniform memory layout.
+    // Replica writes use offsets from primary node, which must match backup node layout.
+    // Optimizing by skipping tables causes offset mismatches and data corruption.
+    return true;
+  };
+
   // Initiate + Populate table for primary role
-  {
+  // Only allocate and populate tables that this node needs
+  if (needsTable(MicroTableType::kMicroTable)) {
     RDMA_LOG(DBG) << "Loading MICRO table";
     std::string config_filepath = "../../../config/micro_config.json";
     auto json_config = JsonConfig::load_file(config_filepath);
@@ -33,20 +42,20 @@ void MICRO::LoadTable(node_id_t node_id,
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign primary
+  // Assign primary (only if table was allocated)
 
-  if ((node_id_t)MicroTableType::kMicroTable % num_server == node_id) {
+  if (micro_table && (node_id_t)MicroTableType::kMicroTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] MICRO table ID: " << (node_id_t)MicroTableType::kMicroTable;
     std::cerr << "Number of initial records: " << std::dec << micro_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(micro_table);
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign backup
+  // Assign backup (only if table was allocated)
 
   if (BACKUP_NUM < num_server) {
     for (node_id_t i = 1; i <= BACKUP_NUM; i++) {
-      if ((node_id_t)MicroTableType::kMicroTable % num_server == (node_id - i + num_server) % num_server) {
+      if (micro_table && (node_id_t)MicroTableType::kMicroTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(EMPH) << "[Backup] MICRO table ID: " << (node_id_t)MicroTableType::kMicroTable;
         std::cerr << "Number of initial records: " << std::dec << micro_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(micro_table);

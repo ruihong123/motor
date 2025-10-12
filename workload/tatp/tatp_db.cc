@@ -15,12 +15,21 @@ void TATP::LoadTable(node_id_t node_id,
                      size_t& ht_size,
                      size_t& initfv_size,
                      size_t& real_cvt_size) {
+  // Helper lambda to check if this node needs a table (primary or backup)
+  auto needsTable = [&](TATPTableType table_type) -> bool {
+    // IMPORTANT: Must allocate ALL tables on ALL nodes to ensure uniform memory layout.
+    // Replica writes use offsets from primary node, which must match backup node layout.
+    // Optimizing by skipping tables causes offset mismatches and data corruption.
+    return true;
+  };
+
   // Initiate + Populate table for primary role
   std::string config_filepath = "../../../config/tatp_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
   auto table_config = json_config.get("tatp");
 
-  {
+  // Only allocate and populate tables that this node needs
+  if (needsTable(TATPTableType::kSubscriberTable)) {
     RDMA_LOG(DBG) << "Loading SUBSCRIBER table";
     subscriber_table = new HashStore((table_id_t)TATPTableType::kSubscriberTable,
                                      table_config.get("num_subscriber").get_uint64(),
@@ -35,7 +44,7 @@ void TATP::LoadTable(node_id_t node_id,
     std::cerr << "SUBSCRIBER max occupy slot num: " << subscriber_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TATPTableType::kSecSubscriberTable)) {
     RDMA_LOG(DBG) << "Loading SECONDARY SUBSCRIBER table";
     sec_subscriber_table = new HashStore((table_id_t)TATPTableType::kSecSubscriberTable,
                                          table_config.get("sec_sub_bkt_num").get_uint64(),
@@ -50,7 +59,7 @@ void TATP::LoadTable(node_id_t node_id,
     std::cerr << "SECONDARY SUBSCRIBER max occupy slot num: " << sec_subscriber_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TATPTableType::kAccessInfoTable)) {
     RDMA_LOG(DBG) << "Loading ACCESS INFO table";
     access_info_table = new HashStore((table_id_t)TATPTableType::kAccessInfoTable,
                                       table_config.get("access_info_bkt_num").get_uint64(),
@@ -65,7 +74,7 @@ void TATP::LoadTable(node_id_t node_id,
     std::cerr << "ACCESS INFO max occupy slot num: " << access_info_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TATPTableType::kSpecialFacilityTable)) {
     RDMA_LOG(DBG) << "Loading SPECIAL FACILITY+CALL FORWARDING table";
     special_facility_table = new HashStore((table_id_t)TATPTableType::kSpecialFacilityTable,
                                            table_config.get("spec_fac_bkt_num").get_uint64(),
@@ -92,26 +101,26 @@ void TATP::LoadTable(node_id_t node_id,
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign primary
-  if ((node_id_t)TATPTableType::kSubscriberTable % num_server == node_id) {
+  // Assign primary (only if table was allocated)
+  if (subscriber_table && (node_id_t)TATPTableType::kSubscriberTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] SUBSCRIBER table ID: " << (node_id_t)TATPTableType::kSubscriberTable;
     std::cerr << "Number of initial records: " << std::dec << subscriber_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(subscriber_table);
   }
 
-  if ((node_id_t)TATPTableType::kSecSubscriberTable % num_server == node_id) {
+  if (sec_subscriber_table && (node_id_t)TATPTableType::kSecSubscriberTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] SECONDARY SUBSCRIBER table ID: " << (node_id_t)TATPTableType::kSecSubscriberTable;
     std::cerr << "Number of initial records: " << std::dec << sec_subscriber_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(sec_subscriber_table);
   }
 
-  if ((node_id_t)TATPTableType::kAccessInfoTable % num_server == node_id) {
+  if (access_info_table && (node_id_t)TATPTableType::kAccessInfoTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] ACCESS INFO table ID: " << (node_id_t)TATPTableType::kAccessInfoTable;
     std::cerr << "Number of initial records: " << std::dec << access_info_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(access_info_table);
   }
 
-  if ((node_id_t)TATPTableType::kSpecialFacilityTable % num_server == node_id) {
+  if (special_facility_table && (node_id_t)TATPTableType::kSpecialFacilityTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] SPECIAL FACILITY+CALL FORWARDING table IDs: " << (node_id_t)TATPTableType::kSpecialFacilityTable << " + " << (node_id_t)TATPTableType::kCallForwardingTable;
     std::cerr << "Number of initial records: " << std::dec << special_facility_table->GetInitInsertNum() << std::endl;
     std::cerr << "Number of initial records: " << std::dec << call_forwarding_table->GetInitInsertNum() << std::endl;
@@ -120,11 +129,11 @@ void TATP::LoadTable(node_id_t node_id,
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign backup
+  // Assign backup (only if table was allocated)
 
   if (BACKUP_NUM < num_server) {
     for (node_id_t i = 1; i <= BACKUP_NUM; i++) {
-      if ((node_id_t)TATPTableType::kSubscriberTable % num_server == (node_id - i + num_server) % num_server) {
+      if (subscriber_table && (node_id_t)TATPTableType::kSubscriberTable % num_server == (node_id - i + num_server) % num_server) {
         // Meaning: I (current node_id) am the backup-SubscriberTable of my primary. My primary-SubscriberTable
         // resides on a node, whose id is TATPTableType::kSubscriberTable % num_server
         // A possible layout: | P (My primary) | B1 (I'm here) | B2 (Or I'm here) |
@@ -133,19 +142,19 @@ void TATP::LoadTable(node_id_t node_id,
         backup_table_ptrs.push_back(subscriber_table);
       }
 
-      if ((node_id_t)TATPTableType::kSecSubscriberTable % num_server == (node_id - i + num_server) % num_server) {
+      if (sec_subscriber_table && (node_id_t)TATPTableType::kSecSubscriberTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] SECONDARY SUBSCRIBER table ID: " << (node_id_t)TATPTableType::kSecSubscriberTable;
         std::cerr << "Number of initial records: " << std::dec << sec_subscriber_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(sec_subscriber_table);
       }
 
-      if ((node_id_t)TATPTableType::kAccessInfoTable % num_server == (node_id - i + num_server) % num_server) {
+      if (access_info_table && (node_id_t)TATPTableType::kAccessInfoTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] ACCESS INFO table ID: " << (node_id_t)TATPTableType::kAccessInfoTable;
         std::cerr << "Number of initial records: " << std::dec << access_info_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(access_info_table);
       }
 
-      if ((node_id_t)TATPTableType::kSpecialFacilityTable % num_server == (node_id - i + num_server) % num_server) {
+      if (special_facility_table && (node_id_t)TATPTableType::kSpecialFacilityTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] SPECIAL FACILITY+CALL FORWARDING table IDs: " << (node_id_t)TATPTableType::kSpecialFacilityTable << " + " << (node_id_t)TATPTableType::kCallForwardingTable;
         std::cerr << "Number of initial records: " << std::dec << special_facility_table->GetInitInsertNum() << std::endl;
         std::cerr << "Number of initial records: " << std::dec << call_forwarding_table->GetInitInsertNum() << std::endl;

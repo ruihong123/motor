@@ -137,7 +137,7 @@ class QPImpl {
       RDMA_ASSERT(false);
       return ERR;
     }
-    RDMA_LOG_IF(4, wc.status != IBV_WC_SUCCESS) << "poll till completion error: " << wc.status << " " << ibv_wc_status_str(wc.status);
+    RDMA_LOG_IF(6, wc.status != IBV_WC_SUCCESS) << "poll till completion error: " << wc.status << " " << ibv_wc_status_str(wc.status);
     return wc.status == IBV_WC_SUCCESS ? SUCC : ERR;
   }
 };
@@ -182,7 +182,7 @@ class RCQPImpl {
     qp_attr.dest_qp_num = attr.qpn;
     qp_attr.rq_psn = config.rq_psn;  // should this match the sender's psn ?
     qp_attr.max_dest_rd_atomic = config.max_dest_rd_atomic;
-    qp_attr.min_rnr_timer = 20;
+    qp_attr.min_rnr_timer = 31;
 
     qp_attr.ah_attr.dlid = attr.lid;
     qp_attr.ah_attr.sl = 0;
@@ -217,7 +217,7 @@ class RCQPImpl {
     qp_attr.dest_qp_num = attr.qpn;
     qp_attr.rq_psn = config.rq_psn;  // should this match the sender's psn ?
     qp_attr.max_dest_rd_atomic = config.max_dest_rd_atomic;
-    qp_attr.min_rnr_timer = 20;
+    qp_attr.min_rnr_timer = 31;
 
     qp_attr.ah_attr.dlid = attr.lid;
     qp_attr.ah_attr.sl = 0;
@@ -249,7 +249,7 @@ class RCQPImpl {
     qp_attr.retry_cnt = 7;
     qp_attr.rnr_retry = 7;
     qp_attr.max_rd_atomic = config.max_rd_atomic;
-    qp_attr.max_dest_rd_atomic = config.max_dest_rd_atomic;
+    // max_dest_rd_atomic is set in RTR transition, not RTS!
 
     flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
       IBV_QP_MAX_QP_RD_ATOMIC;
@@ -275,7 +275,7 @@ class RCQPImpl {
     qp_attr.retry_cnt = 7;
     qp_attr.rnr_retry = 7;
     qp_attr.max_rd_atomic = config.max_rd_atomic;
-    qp_attr.max_dest_rd_atomic = config.max_dest_rd_atomic;
+    // max_dest_rd_atomic is set in RTR transition, not RTS!
 
     flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
       IBV_QP_MAX_QP_RD_ATOMIC;

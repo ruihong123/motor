@@ -148,7 +148,7 @@ class TPCC {
   uint32_t GetCurrentTimeMillis() {
     // implement a scalable GetCurrentTimeMillis()
     // for now, we just give each core an increasing number
-    static __thread uint32_t tl_hack = 0;
+    static __thread uint32_t tl_hack = 1;
     return ++tl_hack;
   }
 

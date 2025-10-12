@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cassert>
+#include <fcntl.h>
 #include <functional>
 
 #include "base/workload.h"
@@ -92,8 +93,12 @@ class HashStore {
     size_t hash_table_size = bucket_num * bkt_size;
     vpkg_size = TABLE_VALUE_SIZE[table_id] + sizeof(anchor_t) * 2;
     total_size = hash_table_size + (SLOT_NUM[table_id] * bucket_n) * vpkg_size;
+    
+    // Round up total_size to 8-byte boundary to ensure next table is properly aligned
+    // This is critical for RDMA CAS operations which require 8-byte alignment
+    size_t aligned_total_size = (total_size + 7) & ~7UL;
 
-    if ((uint64_t)param->hash_store_start + param->alloc_offset + total_size >= (uint64_t)param->mem_store_end) {
+    if ((uint64_t)param->hash_store_start + param->alloc_offset + aligned_total_size >= (uint64_t)param->mem_store_end) {
       RDMA_LOG(FATAL) << "memory region too small!";
     }
 
@@ -103,8 +108,8 @@ class HashStore {
     // Addr of the initial full value region
     value_ptr = table_ptr + hash_table_size;
 
-    // Move the pointer to next table
-    param->alloc_offset += total_size;
+    // Move the pointer to next table - use aligned size to maintain 8-byte alignment
+    param->alloc_offset += aligned_total_size;
 
     // The offset between this hash table and the MR
     base_off = (uint64_t)table_ptr - (uint64_t)region_start_ptr;
@@ -306,6 +311,7 @@ void HashStore::LocalInsertTuple(itemkey_t key, char* value, size_t value_size) 
       return;
     }
   }
-
+  printf("Table %d alloc a new bucket for key: %lu. Current slotnum per bucket: %d\n", table_id, key, SLOT_NUM[table_id]);
+  fflush(stdout);
   RDMA_LOG(FATAL) << "Table " << table_id << " alloc a new bucket for key: " << key << ". Current slotnum per bucket: " << SLOT_NUM[table_id];
 }

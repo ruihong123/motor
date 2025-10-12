@@ -83,8 +83,14 @@ void TXN::SendMsgToReplica(node_id_t copy_from, node_id_t copy_to, table_id_t ta
   int remote_metaport;
   global_meta_man->GetRemoteIP(copy_from, remote_ip, remote_metaport);
 
+  // Try to parse as IP address first
   if (inet_pton(AF_INET, remote_ip.c_str(), &server_addr.sin_addr) <= 0) {
-    RDMA_LOG(FATAL) << "[SendMsgToReplica] inet_pton error: " << strerror(errno);
+    // If not a valid IP, try to resolve as hostname
+    struct hostent* host = gethostbyname(remote_ip.c_str());
+    if (host == nullptr) {
+      RDMA_LOG(FATAL) << "[SendMsgToReplica] cannot resolve hostname: " << remote_ip;
+    }
+    memcpy(&server_addr.sin_addr, host->h_addr_list[0], host->h_length);
   }
 
   server_addr.sin_port = htons(remote_metaport);

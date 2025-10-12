@@ -63,7 +63,7 @@ class QP {
      * return TIMEOUT if there is network error.
      * return NOT_READY if remote server fails to find the connected QP
      */
-  virtual ConnStatus connect(std::string ip, int port, QPIdx idx) = 0;
+  virtual ConnStatus connect(std::string ip, int port, QPIdx idx, int local_node_id = -1) = 0;
 
   // return until the completion events
   // this call will block until a timeout
@@ -144,11 +144,11 @@ class RRCQP : public QP {
     RCQPImpl::init<F>(qp_, cq_, rnic_);
   }
 
-  ConnStatus connect(std::string ip, int port) {
-    return connect(ip, port, idx_);
+  ConnStatus connect(std::string ip, int port, int local_node_id = -1) {
+    return connect(ip, port, idx_, local_node_id);
   }
 
-  ConnStatus connect(std::string ip, int port, QPIdx idx) {
+  ConnStatus connect(std::string ip, int port, QPIdx idx, int local_node_id = -1) {
     // first check whether QP is finished to connect
     enum ibv_qp_state state;
     if ((state = QPImpl::query_qp_status(qp_)) != IBV_QPS_INIT) {
@@ -159,7 +159,7 @@ class RRCQP : public QP {
     ConnArg arg = {};
     ConnReply reply = {};
     arg.type = ConnArg::QP;
-    arg.payload.qp.from_node = idx.node_id;
+    arg.payload.qp.from_node = (local_node_id >= 0) ? local_node_id : idx.node_id;  // Use local_node_id if provided
     arg.payload.qp.from_worker = idx.worker_id;
     arg.payload.qp.qp_type = IBV_QPT_RC;
     arg.payload.qp.qp_attr = get_attr();
@@ -415,16 +415,17 @@ class RUDQP : public QP {
     return qp_;
   }
 
-  ConnStatus connect(std::string ip, int port) {
+  ConnStatus connect(std::string ip, int port, int local_node_id = -1) {
     // UD QP is not bounded to a mac, so use idx to index
-    return connect(ip, port, idx_);
+    return connect(ip, port, local_node_id);
   }
 
-  ConnStatus connect(std::string ip, int port, QPIdx idx) {
+  ConnStatus connect(std::string ip, int port, QPIdx idx, int local_node_id = -1) {
     ConnArg arg;
     ConnReply reply;
     arg.type = ConnArg::QP;
-    arg.payload.qp.from_node = idx.worker_id;
+    arg.payload.qp.from_node = (local_node_id >= 0) ? local_node_id : idx.node_id;  // Use local_node_id if provided
+    arg.payload.qp.from_worker = idx.worker_id;
     arg.payload.qp.from_worker = idx.index;
     arg.payload.qp.qp_type = IBV_QPT_UD;
 

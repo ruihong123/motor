@@ -46,7 +46,7 @@ class PreConnector {  // helper class used to exchange QP information using TCP/
     // port
     serv_addr.sin_port = htons(port);
     int on = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &on, sizeof(on));
     RDMA_ASSERT(bind(sockfd, (struct sockaddr*) &serv_addr,
                      sizeof(serv_addr)) == 0)
       << "ERROR on binding: " << strerror(errno);

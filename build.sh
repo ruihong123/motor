@@ -9,7 +9,7 @@ if [[ -d build ]]; then
 fi
 
 BUILD_TARGET=client
-BUILD_TYPE=Release
+BUILD_TYPE=Debug
 
 while getopts "sd" arg
 do
@@ -37,9 +37,9 @@ ${CMAKE_CMD}
 
 if [ "${BUILD_TARGET}" == "server" ];then
   echo "------------------- building server ------------------"
-  make motor_mempool -j32
+  make motor_mempool -j
 else
   echo "------------------- building client + server ------------------"
-  make -j32
+  make -j
 fi
 echo "-------------------- build finish ----------------------"

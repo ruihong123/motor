@@ -103,6 +103,7 @@ bool TXN::CheckValueRW(std::vector<ValueRead>& pending_value_read,
     anchor_t fetched_value_sa = *((anchor_t*)p);
     char* fetched_value = p + sizeof(anchor_t);
     size_t value_size = TABLE_VALUE_SIZE[fetched_it.item->header.table_id];
+    
     p = p + sizeof(anchor_t) + value_size;
     anchor_t fetched_value_ea = *((anchor_t*)p);
 

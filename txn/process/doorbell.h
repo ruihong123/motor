@@ -10,7 +10,7 @@
 
 using namespace rdmaio;
 
-static const int MAX_DOORBELL_LEN = 124;
+static const int MAX_DOORBELL_LEN = 64;
 
 // Several RDMA requests are sent to the QP in a doorbelled (or batched) way.
 // These requests are executed within one round trip
@@ -130,6 +130,7 @@ class LockReadTwoBatch {
     sr[0].wr.atomic.remote_addr += qp->remote_mr_.buf;
     sr[0].wr.atomic.rkey = qp->remote_mr_.key;
     sge[0].lkey = qp->local_mr_.key;
+      assert(sr[0].wr.atomic.remote_addr%8 == 0);
 
     sr[1].wr.rdma.remote_addr += qp->remote_mr_.buf;
     sr[1].wr.rdma.rkey = qp->remote_mr_.key;

@@ -5,6 +5,7 @@
 
 #include "allocator/region_allocator.h"
 #include "base/common.h"
+#include <cstdio>
 
 // Alloc registered RDMA buffer for each thread
 class LocalBufferAllocator {
@@ -86,6 +87,8 @@ class RemoteDeltaOffsetAllocator {
   ALWAYS_INLINE
   uintptr_t NextDeltaOffset(size_t write_size) {
     if (unlikely(start + cur_offset + write_size > end)) {
+      printf("Delta buffer not enough for this thread! Current usage: %f MB delta space\n", (double)(cur_offset + write_size) / 1024 / 1024);
+      fflush(stdout);
       RDMA_LOG(FATAL) << "Delta buffer not enough for this thread! Current usage: " << (double)(cur_offset + write_size) / 1024 / 1024 << " MB delta space";
     }
 

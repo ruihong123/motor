@@ -81,6 +81,12 @@ __thread uint64_t last_stat_attempted_tx_total = 0;
 __thread uint64_t last_stat_committed_tx_total = 0;
 const coro_id_t POLL_ROUTINE_ID = 0;  // The poll coroutine ID
 
+// Debug: Track current transaction state per coroutine
+__thread const char* current_tx_name[10] = {nullptr};  // Track current tx per coro
+__thread uint64_t current_tx_id[10] = {0};
+__thread table_id_t last_accessed_table[10] = {0};
+__thread itemkey_t last_accessed_key[10] = {0};
+
 // For MICRO benchmark
 __thread ZipfGen* zipf_gen = nullptr;
 __thread bool is_skewed;
@@ -208,6 +214,12 @@ void RunTATP(coro_yield_t& yield, coro_id_t coro_id) {
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - tx_start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - tx_start_time.tv_nsec) / 1000;
       timer[stat_committed_tx_total++] = tx_usec;
+      
+      // Print progress every 10,000 transactions
+      if (stat_committed_tx_total % 10000 == 0) {
+        printf("Node %d Thread %u (TATP): Completed %lu transactions\n", meta_man->local_machine_id, thread_gid, stat_committed_tx_total);
+        fflush(stdout);
+      }
     }
     if (stat_attempted_tx_total >= ATTEMPTED_NUM) {
       // A coroutine calculate the total execution time and exits
@@ -292,6 +304,12 @@ void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - tx_start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - tx_start_time.tv_nsec) / 1000;
       timer[stat_committed_tx_total++] = tx_usec;
+      
+      // Print progress every 10,000 transactions
+      if (stat_committed_tx_total % 10000 == 0) {
+        printf("Node %d Thread %u (SmallBank): Completed %lu transactions\n", meta_man->local_machine_id, thread_gid, stat_committed_tx_total);
+        fflush(stdout);
+      }
     }
     if (stat_attempted_tx_total >= ATTEMPTED_NUM) {
       // A coroutine calculate the total execution time and exits
@@ -376,6 +394,12 @@ void RunTPCC(coro_yield_t& yield, coro_id_t coro_id, int finished_num) {
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - tx_start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - tx_start_time.tv_nsec) / 1000;
       timer[stat_committed_tx_total++] = tx_usec;
+      
+      // Print progress every 10,000 transactions
+      if (stat_committed_tx_total % 10000 == 0) {
+        printf("Node %d Thread %u (TPCC): Completed %lu transactions\n", meta_man->local_machine_id, thread_gid, stat_committed_tx_total);
+        fflush(stdout);
+      }
     }
 
     if (stat_attempted_tx_total >= (ATTEMPTED_NUM - finished_num)) {
@@ -491,6 +515,12 @@ void RunMICRO(coro_yield_t& yield, coro_id_t coro_id) {
       clock_gettime(CLOCK_REALTIME, &tx_end_time);
       double tx_usec = (tx_end_time.tv_sec - tx_start_time.tv_sec) * 1000000 + (double)(tx_end_time.tv_nsec - tx_start_time.tv_nsec) / 1000;
       timer[stat_committed_tx_total++] = tx_usec;
+      
+      // Print progress every 10,000 transactions
+      if (stat_committed_tx_total % 10000 == 0) {
+        printf("Node %d Thread %u (MICRO): Completed %lu transactions\n", meta_man->local_machine_id, thread_gid, stat_committed_tx_total);
+        fflush(stdout);
+      }
     }
 
     if (stat_committed_tx_total >= ATTEMPTED_NUM) {
@@ -544,7 +574,7 @@ void run_thread(thread_params* params,
   thread_local_id = params->thread_local_id;
   meta_man = params->global_meta_man;
   coro_num = (coro_id_t)params->coro_num;
-  coro_sched = new CoroutineScheduler(thread_gid, coro_num);
+  coro_sched = new CoroutineScheduler(thread_gid, coro_num, meta_man->local_machine_id);
 
   addr_cache = params->addr_cache;
 
@@ -604,6 +634,8 @@ void run_thread(thread_params* params,
       }
     }
   }
+
+  RDMA_LOG(INFO) << "Thread " << thread_gid << " created " << coro_num << " coroutines (including 1 poll coroutine)";
 
   // Link all coroutines via pointers in a loop manner
   coro_sched->LoopLinkCoroutine(coro_num);
@@ -679,7 +711,7 @@ void recovery(thread_params* params,
   thread_local_id = params->thread_local_id;
   meta_man = params->global_meta_man;
   coro_num = (coro_id_t)params->coro_num;
-  coro_sched = new CoroutineScheduler(thread_gid, coro_num);
+  coro_sched = new CoroutineScheduler(thread_gid, coro_num, meta_man->local_machine_id);
 
   addr_cache = params->addr_cache;
 
@@ -739,6 +771,8 @@ void recovery(thread_params* params,
       }
     }
   }
+
+  RDMA_LOG(INFO) << "Thread " << thread_gid << " created " << coro_num << " coroutines for recovery (including 1 poll coroutine)";
 
   // Link all coroutines via pointers in a loop manner
   coro_sched->LoopLinkCoroutine(coro_num);

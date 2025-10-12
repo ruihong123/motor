@@ -581,7 +581,7 @@ bool TxDelivery(TPCC* tpcc_client,
   "updateCustomer": "UPDATE CUSTOMER SET C_BALANCE = C_BALANCE + ? WHERE C_ID = ? AND C_D_ID = ? AND C_W_ID = ?", # ol_total, c_id, d_id, w_id
   */
 
-  txn->Begin(tx_id, TXN_TYPE::kRWTxn);
+  txn->Begin(tx_id, TXN_TYPE::kRWTxn, "dl");
 
   // Generate parameters
 
@@ -741,7 +741,7 @@ bool TxOrderStatus(TPCC* tpcc_client,
   },
   */
 
-  txn->Begin(tx_id, TXN_TYPE::kROTxn);
+  txn->Begin(tx_id, TXN_TYPE::kROTxn, "os");
 
   int y = tpcc_client->RandomNumber(random_generator[txn->coro_id], 1, 100);
 

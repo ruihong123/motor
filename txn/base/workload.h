@@ -64,8 +64,22 @@ constexpr size_t ATTR_BAR_SIZE[TPCC_TOTAL_TABLES] = {
     sizeof(tpcc_order_index_val_t::o_id) * MAX_VCELL_NUM,
 };
 
+// enum TPCCTableType : uint64_t {
+//     kWarehouseTable = TABLE_TPCC,
+//     kDistrictTable,
+//     kCustomerTable,
+//     kHistoryTable,
+//     kNewOrderTable,
+//     kOrderTable,
+//     kOrderLineTable,
+//     kItemTable,
+//     kStockTable,
+//     kCustomerIndexTable,
+//     kOrderIndexTable,
+//   };
+
 constexpr size_t SLOT_NUM[TPCC_TOTAL_TABLES] = {
-    1, 1, 3, 15, 15, 15, 15, 1, 4, 1, 15};
+    1, 1, 3, 8, 8, 8, 15, 1, 4, 1, 1};
 
 constexpr int ATTRIBUTE_NUM[TPCC_TOTAL_TABLES] = {8, 9, 18, 3, 1, 5, 6, 4, 6, 1, 1};
 

@@ -323,6 +323,12 @@ void TXN::Begin(tx_id_t txid, TXN_TYPE txn_t, const std::string& name) {
 
   thread_locked_key_table[coro_id].num_entry = 0;
   thread_locked_key_table[coro_id].tx_id = txid;
+  
+  // Debug tracking
+  extern __thread const char* current_tx_name[];
+  extern __thread uint64_t current_tx_id[];
+  current_tx_name[coro_id] = name.c_str();
+  current_tx_id[coro_id] = txid;
 }
 
 ALWAYS_INLINE
@@ -330,6 +336,12 @@ void TXN::AddToReadOnlySet(DataSetItemPtr item) {
 #if OUTPUT_KEY_STAT
   key_counter.RegKey(t_id, KeyType::kKeyRead, txn_name, item->header.table_id, item->header.key);
 #endif
+
+  // Debug tracking
+  extern __thread table_id_t last_accessed_table[];
+  extern __thread itemkey_t last_accessed_key[];
+  last_accessed_table[coro_id] = item->header.table_id;
+  last_accessed_key[coro_id] = item->header.key;
 
   read_only_set.emplace_back(item);
 }
@@ -339,6 +351,13 @@ void TXN::AddToReadWriteSet(DataSetItemPtr item) {
 #if OUTPUT_KEY_STAT
   key_counter.RegKey(t_id, KeyType::kKeyWrite, txn_name, item->header.table_id, item->header.key);
 #endif
+
+  // Debug tracking
+  extern __thread table_id_t last_accessed_table[];
+  extern __thread itemkey_t last_accessed_key[];
+  last_accessed_table[coro_id] = item->header.table_id;
+  last_accessed_key[coro_id] = item->header.key;
+
   read_write_set.emplace_back(item);
 }
 

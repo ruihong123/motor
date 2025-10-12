@@ -175,10 +175,12 @@ class MetaManager {
 
   std::unordered_map<node_id_t, MemoryAttr> remote_hash_mrs;
 
-  node_id_t local_machine_id;
 
 
  public:
+
+  node_id_t local_machine_id;
+
   offset_t delta_start_off;
 
   size_t per_thread_delta_size;

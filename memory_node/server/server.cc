@@ -34,6 +34,9 @@ void Server::AllocMem() {
   }
 
   hash_buffer = mem_region;  // Different indexes will occupy the memory region
+  
+  // Verify 8-byte alignment for RDMA CAS operations
+  assert(((uintptr_t)hash_buffer % 8) == 0 && "hash_buffer must be 8-byte aligned for RDMA CAS operations");
 }
 
 void Server::InitMem() {
@@ -99,12 +102,40 @@ void Server::ConnectMN() {
     do {
       rc = data_qp->connect(remote_ip, remote_port);
       if (rc == SUCC) {
+        // Validate QP state transitioned to RTS
+        struct ibv_qp_attr qp_attr;
+        struct ibv_qp_init_attr qp_init_attr;
+        int query_rc = ibv_query_qp(data_qp->qp_, &qp_attr, 
+                                     IBV_QP_STATE | IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_MAX_DEST_RD_ATOMIC, 
+                                     &qp_init_attr);
+          assert(qp_attr.max_dest_rd_atomic == 16);
+          assert(qp_attr.max_rd_atomic == 16);
+        
+        if (query_rc != 0) {
+          RDMA_LOG(ERROR) << "Failed to query QP state for MN ID: " << remote_node_id;
+          rc = ERR;
+          continue;
+        }
+        
+        // Assert QP is in RTS state
+        if (qp_attr.qp_state != IBV_QPS_RTS) {
+          RDMA_LOG(FATAL) << "MN ConnectMN: QP to node " << remote_node_id 
+                          << " NOT in RTS state! Current state: " << qp_attr.qp_state
+                          << " (Expected: " << IBV_QPS_RTS << " = RTS)";
+          assert(qp_attr.qp_state == IBV_QPS_RTS && "QP must be in RTS state after connect!");
+        }
+        
+        // Log successful transition with attributes
+        RDMA_LOG(INFO) << "Connect QP with MN ID: " << remote_node_id 
+                       << " IP: " << remote_ip << " PORT: " << remote_port 
+                       << " Success! QP State: RTS"
+                       << ", max_rd_atomic: " << qp_attr.max_rd_atomic
+                       << ", max_dest_rd_atomic: " << qp_attr.max_dest_rd_atomic;
+        
         // Bind the hash mr as the default remote mr for convenient parameter passing
         data_qp->bind_remote_mr(remote_mr);
 
         other_mn_qps[remote_node_id] = data_qp;
-
-        RDMA_LOG(INFO) << "Connect QP with MN ID: " << remote_node_id << " IP: " << remote_ip << " PORT: " << remote_port << " Success!";
       }
       usleep(2000);
     } while (rc != SUCC);
@@ -207,6 +238,35 @@ void Server::LoadData(node_id_t machine_id,
   // of_ft.close();
 
   RDMA_LOG(INFO) << "Loading table successfully!";
+  
+  // Print memory allocation summary
+  printf("\n");
+  printf("==================== Memory Allocation Summary ====================\n");
+  printf("Total allocated memory:     %10.2f MB  (%lu bytes)\n", 
+         (double)total_size / 1024.0 / 1024.0, total_size);
+  printf("  Hash table + init values: %10.2f MB  (%lu bytes)\n", 
+         (double)ht_loadfv_size / 1024.0 / 1024.0, ht_loadfv_size);
+  printf("  Hash table only:          %10.2f MB  (%lu bytes)\n", 
+         (double)ht_size / 1024.0 / 1024.0, ht_size);
+  printf("  Initial full values:      %10.2f MB  (%lu bytes)\n", 
+         (double)initfv_size / 1024.0 / 1024.0, initfv_size);
+  printf("  Effective CVT size:       %10.2f MB  (%lu bytes)\n", 
+         (double)real_cvt_size / 1024.0 / 1024.0, real_cvt_size);
+  printf("\n");
+  printf("Memory region capacity:     %10.2f MB  (%lu bytes)\n", 
+         (double)data_size / 1024.0 / 1024.0, data_size);
+  printf("Delta region capacity:      %10.2f MB  (%lu bytes)\n", 
+         (double)delta_size / 1024.0 / 1024.0, delta_size);
+  printf("Total capacity:             %10.2f MB  (%lu bytes)\n", 
+         (double)(data_size + delta_size) / 1024.0 / 1024.0, data_size + delta_size);
+  printf("\n");
+  printf("Memory utilization:         %10.2f%%\n", 
+         (double)total_size / (double)data_size * 100.0);
+  printf("Remaining capacity:         %10.2f MB  (%lu bytes)\n", 
+         (double)(data_size - total_size) / 1024.0 / 1024.0, data_size - total_size);
+  printf("===================================================================\n");
+  printf("\n");
+  fflush(stdout);
 }
 
 void Server::CleanTable() {
@@ -633,12 +693,19 @@ bool Server::Run(std::string& workload) {
     } else if (ch == 'c') {
       return true;
     } else {
-      std::cerr << "Type c for another round, type q to exit :)" << std::endl;
+      // Silently ignore invalid input when running in background
+      // std::cerr << "Type c for another round, type q to exit :)" << std::endl;
     }
   }
 }
 
 int main(int argc, char* argv[]) {
+  // Check for non-interactive mode flag
+  bool non_interactive = false;
+  if (argc > 1 && std::string(argv[1]) == "--no-interactive") {
+    non_interactive = true;
+  }
+  
   // Configure of this server
   std::string config_filepath = "../../../config/mn_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
@@ -684,7 +751,18 @@ int main(int argc, char* argv[]) {
 
   server->LoadData(machine_id, machine_num, workload);
   server->SendMeta(machine_id, workload, compute_node_num, data_size, per_thread_delta_size);
-  bool run_next_round = server->Run(workload);
+  
+  bool run_next_round = false;
+  if (non_interactive) {
+    // Non-interactive mode: just wait indefinitely (for cluster/daemon mode)
+    RDMA_LOG(INFO) << "Running in non-interactive mode. Use kill/pkill to stop.";
+    while (true) {
+      sleep(3600);  // Sleep for 1 hour, repeat
+    }
+  } else {
+    // Interactive mode: wait for user input
+    run_next_round = server->Run(workload);
+  }
 
   // Continue to run the next round. RDMA does not need to be inited twice
   while (run_next_round) {

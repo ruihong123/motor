@@ -2,6 +2,7 @@
 // Copyright (c) 2023
 
 #include "tpcc_db.h"
+#include <cassert>
 
 #define NUM_CUSTOMER_LAST_NAME_FROM_CID 100
 #define NUM_ORDER_MINUS_NEWORDER 210
@@ -34,12 +35,19 @@ void TPCC::LoadTable(node_id_t node_id,
   //     sizeof(tpcc_stock_val_t),
   //     CVTSize);
 
+  // Helper lambda to check if this node needs a table (primary or backup)
+  auto needsTable = [&](TPCCTableType table_type) -> bool {
+    // Only allocate tables that are primary on this node
+    return true;
+  };
+
   // Initiate + Populate table for primary role
   std::string config_filepath = "../../../config/tpcc_config.json";
   auto json_config = JsonConfig::load_file(config_filepath);
   auto table_config = json_config.get("tpcc");
 
-  {
+  // Only allocate and populate tables that this node needs
+  if (needsTable(TPCCTableType::kWarehouseTable)) {
     RDMA_LOG(DBG) << "Loading Warehouse table";
     warehouse_table = new HashStore((table_id_t)TPCCTableType::kWarehouseTable,
                                     table_config.get("warehouse_bkt_num").get_uint64(),
@@ -53,7 +61,7 @@ void TPCC::LoadTable(node_id_t node_id,
     std::cerr << "Warehouse max occupy slot num: " << warehouse_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TPCCTableType::kDistrictTable)) {
     RDMA_LOG(DBG) << "Loading District table";
     district_table = new HashStore((table_id_t)TPCCTableType::kDistrictTable,
                                    table_config.get("warehouse_bkt_num").get_uint64() *
@@ -68,7 +76,7 @@ void TPCC::LoadTable(node_id_t node_id,
     std::cerr << "District max occupy slot num: " << district_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TPCCTableType::kCustomerTable)) {
     RDMA_LOG(DBG) << "Loading Customer+CustomerIndex+History table";
     customer_table = new HashStore((table_id_t)TPCCTableType::kCustomerTable,
                                    table_config.get("warehouse_bkt_num").get_uint64() *
@@ -111,7 +119,7 @@ void TPCC::LoadTable(node_id_t node_id,
     std::cerr << "History max occupy slot num: " << history_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TPCCTableType::kOrderTable)) {
     RDMA_LOG(DBG) << "Loading Order+OrderIndex+NewOrder+OrderLine table";
     order_table = new HashStore((table_id_t)TPCCTableType::kOrderTable,
                                 table_config.get("warehouse_bkt_num").get_uint64() *
@@ -171,7 +179,7 @@ void TPCC::LoadTable(node_id_t node_id,
     std::cerr << "OrderLine max occupy slot num: " << order_line_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TPCCTableType::kStockTable)) {
     RDMA_LOG(DBG) << "Loading Stock table";
     stock_table = new HashStore((table_id_t)TPCCTableType::kStockTable,
                                 table_config.get("warehouse_bkt_num").get_uint64() *
@@ -187,7 +195,7 @@ void TPCC::LoadTable(node_id_t node_id,
     std::cerr << "Stock max occupy slot num: " << stock_table->GetMaxOccupySlotNum() << std::endl;
   }
 
-  {
+  if (needsTable(TPCCTableType::kItemTable)) {
     RDMA_LOG(DBG) << "Loading Item table";
     item_table = new HashStore((table_id_t)TPCCTableType::kItemTable,
                                table_config.get("item_bkt_num").get_uint64(),
@@ -203,20 +211,20 @@ void TPCC::LoadTable(node_id_t node_id,
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign primary
-  if ((node_id_t)TPCCTableType::kWarehouseTable % num_server == node_id) {
+  // Assign primary (only if table was allocated)
+  if (warehouse_table && (node_id_t)TPCCTableType::kWarehouseTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] Warehouse table ID: " << (node_id_t)TPCCTableType::kWarehouseTable;
     std::cerr << "Number of initial records: " << std::dec << warehouse_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(warehouse_table);
   }
 
-  if ((node_id_t)TPCCTableType::kDistrictTable % num_server == node_id) {
+  if (district_table && (node_id_t)TPCCTableType::kDistrictTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] District table ID: " << (node_id_t)TPCCTableType::kDistrictTable;
     std::cerr << "Number of initial records: " << std::dec << district_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(district_table);
   }
 
-  if ((node_id_t)TPCCTableType::kCustomerTable % num_server == node_id) {
+  if (customer_table && (node_id_t)TPCCTableType::kCustomerTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] Customer+CustomerIndex+History table IDs: " << (node_id_t)TPCCTableType::kCustomerTable
                    << " + " << (node_id_t)TPCCTableType::kCustomerIndexTable
                    << " + " << (node_id_t)TPCCTableType::kHistoryTable;
@@ -230,7 +238,7 @@ void TPCC::LoadTable(node_id_t node_id,
     primary_table_ptrs.push_back(history_table);
   }
 
-  if ((node_id_t)TPCCTableType::kOrderTable % num_server == node_id) {
+  if (order_table && (node_id_t)TPCCTableType::kOrderTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] Order+OrderIndex+NewOrder+OrderLine table IDs: " << (node_id_t)TPCCTableType::kOrderTable
                    << " + " << (node_id_t)TPCCTableType::kOrderIndexTable
                    << " + " << (node_id_t)TPCCTableType::kNewOrderTable
@@ -247,35 +255,35 @@ void TPCC::LoadTable(node_id_t node_id,
     primary_table_ptrs.push_back(order_line_table);
   }
 
-  if ((node_id_t)TPCCTableType::kStockTable % num_server == node_id) {
+  if (stock_table && (node_id_t)TPCCTableType::kStockTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] Stock table ID: " << (node_id_t)TPCCTableType::kStockTable;
     std::cerr << "Number of initial records: " << std::dec << stock_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(stock_table);
   }
 
-  if ((node_id_t)TPCCTableType::kItemTable % num_server == node_id) {
+  if (item_table && (node_id_t)TPCCTableType::kItemTable % num_server == node_id) {
     RDMA_LOG(EMPH) << "[Primary] Item table ID: " << (node_id_t)TPCCTableType::kItemTable;
     std::cerr << "Number of initial records: " << std::dec << item_table->GetInitInsertNum() << std::endl;
     primary_table_ptrs.push_back(item_table);
   }
 
   std::cout << "----------------------------------------------------------" << std::endl;
-  // Assign backup
+  // Assign backup (only if table was allocated)
   if (BACKUP_NUM < num_server) {
     for (node_id_t i = 1; i <= BACKUP_NUM; i++) {
-      if ((node_id_t)TPCCTableType::kWarehouseTable % num_server == (node_id - i + num_server) % num_server) {
+      if (warehouse_table && (node_id_t)TPCCTableType::kWarehouseTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] Warehouse table ID: " << (node_id_t)TPCCTableType::kWarehouseTable;
         std::cerr << "Number of initial records: " << std::dec << warehouse_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(warehouse_table);
       }
 
-      if ((node_id_t)TPCCTableType::kDistrictTable % num_server == (node_id - i + num_server) % num_server) {
+      if (district_table && (node_id_t)TPCCTableType::kDistrictTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] District table ID: " << (node_id_t)TPCCTableType::kDistrictTable;
         std::cerr << "Number of initial records: " << std::dec << district_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(district_table);
       }
 
-      if ((node_id_t)TPCCTableType::kCustomerTable % num_server == (node_id - i + num_server) % num_server) {
+      if (customer_table && (node_id_t)TPCCTableType::kCustomerTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] Customer+CustomerIndex+History table IDs: " << (node_id_t)TPCCTableType::kCustomerTable
                       << " + " << (node_id_t)TPCCTableType::kCustomerIndexTable
                       << " + " << (node_id_t)TPCCTableType::kHistoryTable;
@@ -289,7 +297,7 @@ void TPCC::LoadTable(node_id_t node_id,
         backup_table_ptrs.push_back(history_table);
       }
 
-      if ((node_id_t)TPCCTableType::kOrderTable % num_server == (node_id - i + num_server) % num_server) {
+      if (order_table && (node_id_t)TPCCTableType::kOrderTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] Order+OrderIndex+NewOrder+OrderLine table IDs: " << (node_id_t)TPCCTableType::kOrderTable
                       << " + " << (node_id_t)TPCCTableType::kOrderIndexTable
                       << " + " << (node_id_t)TPCCTableType::kNewOrderTable
@@ -306,13 +314,13 @@ void TPCC::LoadTable(node_id_t node_id,
         backup_table_ptrs.push_back(order_line_table);
       }
 
-      if ((node_id_t)TPCCTableType::kStockTable % num_server == (node_id - i + num_server) % num_server) {
+      if (stock_table && (node_id_t)TPCCTableType::kStockTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] Stock table ID: " << (node_id_t)TPCCTableType::kStockTable;
         std::cerr << "Number of initial records: " << std::dec << stock_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(stock_table);
       }
 
-      if ((node_id_t)TPCCTableType::kItemTable % num_server == (node_id - i + num_server) % num_server) {
+      if (item_table && (node_id_t)TPCCTableType::kItemTable % num_server == (node_id - i + num_server) % num_server) {
         RDMA_LOG(DBG) << "[Backup] Item table ID: " << (node_id_t)TPCCTableType::kItemTable;
         std::cerr << "Number of initial records: " << std::dec << item_table->GetInitInsertNum() << std::endl;
         backup_table_ptrs.push_back(item_table);
@@ -438,12 +446,12 @@ void TPCC::Populate_Customer_CustomerIndex_History_Table(unsigned long seed) {
 
         strcpy(customer_val.c_phone, RandomNStr(random_generator, tpcc_customer_val_t::PHONE).c_str());
         customer_val.c_since = GetCurrentTimeMillis();
+        assert(customer_val.c_since != 0);
         strcpy(customer_val.c_middle, "OE");
         strcpy(customer_val.c_data, RandomStr(random_generator, RandomNumber(random_generator, tpcc_customer_val_t::MIN_DATA, tpcc_customer_val_t::MAX_DATA)).c_str());
 
         assert(!strcmp(customer_val.c_credit, "BC") || !strcmp(customer_val.c_credit, "GC"));
         assert(!strcmp(customer_val.c_middle, "OE"));
-        // printf("before insert customer record\n");
 
         LoadRecord(customer_table,
                    customer_key.item_key,

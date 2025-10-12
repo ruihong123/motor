@@ -1,3 +1,4 @@
+#include <cassert>
 #include <pthread.h>
 
 #include <map>
@@ -399,7 +400,7 @@ class RdmaCtrl::RdmaCtrlImpl {
               case IBV_QPT_RC: {
                 // MZ: Server passively accepts and connects QPs. It is more efficient than the original rlib
                 QPIdx idx = create_rc_idx(arg.payload.qp.from_node, arg.payload.qp.from_worker);
-                // RDMA_LOG(INFO) << "Receive QP request, my node id: " << arg.payload.qp.from_node << ", client worker id: " << arg.payload.qp.from_worker;
+                
                 qp = get_qp<RCQP, get_rc_key>(idx); // For multi round tests
                 if (qp == nullptr) {
                   qp = create_rc_qp(idx, opened_rnic, NULL);
@@ -409,10 +410,26 @@ class RdmaCtrl::RdmaCtrlImpl {
                   if (!RCQPImpl::readytosend(qp->qp_)) {
                     RDMA_LOG(FATAL) << "change qp_attr status to ready to send error: " << strerror(errno);
                   }
+                  
+                  // Validate QP is actually in RTS state after setup
+                  struct ibv_qp_attr qp_attr;
+                  struct ibv_qp_init_attr qp_init_attr;
+                  if (ibv_query_qp(qp->qp_, &qp_attr, IBV_QP_STATE, &qp_init_attr) == 0) {
+                      assert(qp_attr.max_dest_rd_atomic == 16 && qp_attr.max_rd_atomic == 16);
+                    if (qp_attr.qp_state != IBV_QPS_RTS) {
+                      RDMA_LOG(FATAL) << "Server AcceptReq: QP from node " << arg.payload.qp.from_node 
+                                      << " worker " << arg.payload.qp.from_worker
+                                      << " NOT in RTS state! Current state: " << qp_attr.qp_state;
+                      assert(qp_attr.qp_state == IBV_QPS_RTS && "Server QP must reach RTS state!");
+                    }
+                  }
                 }
               }
                 break;
-              default:RDMA_LOG(ERROR) << "unknown QP connection type: " << arg.payload.qp.qp_type;
+              default:{
+                assert(false);
+                RDMA_LOG(ERROR) << "unknown QP connection type: " << arg.payload.qp.qp_type;
+              }
             }
             if (qp != nullptr) {
               reply.payload.qp = qp->get_attr();

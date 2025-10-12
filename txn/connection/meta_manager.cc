@@ -18,17 +18,16 @@ MetaManager::MetaManager() {
   auto remote_ports = mem_nodes.get("remote_ports");            // Array Used for RDMA exchanges
   auto remote_meta_ports = mem_nodes.get("remote_meta_ports");  // Array Used for transferring datastore metas
 
-  // Get remote machine's memory store meta via TCP
   for (size_t index = 0; index < remote_ips.size(); index++) {
     std::string remote_ip = remote_ips.get(index).get_str();
     int remote_meta_port = (int)remote_meta_ports.get(index).get_int64();
-    // RDMA_LOG(INFO) << "get hash meta from " << remote_ip;
     node_id_t remote_machine_id = GetMemStoreMeta(remote_ip, remote_meta_port);
     if (remote_machine_id == -1) {
       RDMA_LOG(FATAL) << "Thread " << std::this_thread::get_id() << " GetMemStoreMeta() failed!, remote_machine_id = -1";
     }
     int remote_port = (int)remote_ports.get(index).get_int64();
     remote_nodes.push_back(RemoteNode{.node_id = remote_machine_id, .ip = remote_ip, .port = remote_port, .meta_port = remote_meta_port});
+
   }
 
   std::cout << "--------------\n";
@@ -96,9 +95,16 @@ node_id_t MetaManager::GetMemStoreMeta(std::string& remote_ip, int remote_port) 
   /* ---------------Initialize socket---------------- */
   struct sockaddr_in server_addr;
   server_addr.sin_family = AF_INET;
+  
+  // Try to parse as IP address first
   if (inet_pton(AF_INET, remote_ip.c_str(), &server_addr.sin_addr) <= 0) {
-    RDMA_LOG(ERROR) << "MetaManager inet_pton error: " << strerror(errno);
-    abort();
+    // If not a valid IP, try to resolve as hostname
+    struct hostent* host = gethostbyname(remote_ip.c_str());
+    if (host == nullptr) {
+      RDMA_LOG(ERROR) << "MetaManager cannot resolve hostname: " << remote_ip;
+      abort();
+    }
+    memcpy(&server_addr.sin_addr, host->h_addr_list[0], host->h_length);
   }
   server_addr.sin_port = htons(remote_port);
   int client_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -113,11 +119,34 @@ node_id_t MetaManager::GetMemStoreMeta(std::string& remote_ip, int remote_port) 
     abort();
   }
 
-  if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-    RDMA_LOG(ERROR) << "MetaManager connect error: " << strerror(errno);
-    RDMA_LOG(ERROR) << "Memory node may have NOT finished loading data!";
+  // Retry connection with timeout (memory node might still be loading data)
+  int max_retries = 300;  // Try for up to 120 seconds
+  int retry_count = 0;
+  while (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    if (retry_count >= max_retries) {
+      RDMA_LOG(ERROR) << "MetaManager connect error after " << max_retries << " retries: " << strerror(errno);
+      RDMA_LOG(ERROR) << "Memory node " << remote_ip << ":" << remote_port << " may have NOT finished loading data!";
+      close(client_socket);
+      abort();
+    }
+    if (retry_count == 0) {
+      RDMA_LOG(WARNING) << "Waiting for memory node " << remote_ip << ":" << remote_port << " to be ready...";
+    }
+    retry_count++;
+    sleep(1);  // Wait 1 second before retry
+    
+    // Need to recreate socket for each retry attempt
     close(client_socket);
-    abort();
+    client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(client_socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (client_socket < 0) {
+      RDMA_LOG(ERROR) << "MetaManager creates socket error during retry: " << strerror(errno);
+      abort();
+    }
+  }
+  
+  if (retry_count > 0) {
+    RDMA_LOG(INFO) << "Successfully connected to memory node " << remote_ip << ":" << remote_port << " after " << retry_count << " retries";
   }
 
   /* --------------- Receiving hash metadata ----------------- */
