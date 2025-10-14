@@ -9,7 +9,20 @@
     "iso_level": 2,
     "crash_tnum": 20,
     "crash_time_ms": 3000,
-    "tp_probe_interval_ms": 1
+    "tp_probe_interval_ms": 1,
+    "barrier_port": 23456
+  },
+  "compute_nodes": {
+    "compute_ips": [
+      "node-0",
+      "node-1",
+      "node-2",
+      "node-3",
+      "node-4",
+      "node-5",
+      "node-6",
+      "node-7"
+    ]
   },
   "remote_mem_nodes": {
     "remote_ips": [

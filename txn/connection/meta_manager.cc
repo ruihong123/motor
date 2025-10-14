@@ -156,10 +156,25 @@ node_id_t MetaManager::GetMemStoreMeta(std::string& remote_ip, int remote_port) 
 
   auto retlen = recv(client_socket, recv_buf, hash_meta_size, 0);
   if (retlen < 0) {
-    RDMA_LOG(ERROR) << "MetaManager receives hash meta error: " << strerror(errno);
+      int error = errno;
+    RDMA_LOG(ERROR) << "MetaManager receives hash meta error from " << remote_ip << ":" << remote_port;
+    RDMA_LOG(ERROR) << "  Error code: " << error << " (" << strerror(error) << ")";
+    RDMA_LOG(ERROR) << "  Expected buffer size: " << hash_meta_size << " bytes";
+    RDMA_LOG(ERROR) << "  Actual return value: " << retlen;
+    
     free(recv_buf);
     close(client_socket);
     abort();
+  } else if (retlen == 0) {
+    RDMA_LOG(ERROR) << "MetaManager: Connection closed by remote " << remote_ip << ":" << remote_port 
+                    << " before receiving hash metadata";
+    RDMA_LOG(ERROR) << "  This usually means the memory node crashed or closed the connection prematurely";
+    free(recv_buf);
+    close(client_socket);
+    abort();
+  } else {
+    RDMA_LOG(INFO) << "MetaManager: Successfully received " << retlen << " bytes of hash metadata from " 
+                   << remote_ip << ":" << remote_port;
   }
 
   char ack[] = "[ACK]hash_meta_received_from_client";

@@ -1,7 +1,7 @@
 {
   "tpcc": {
-    "num_warehouse": 40,
-    "warehouse_bkt_num": 50,
+    "num_warehouse": 50,
+    "warehouse_bkt_num": 60,
 
     "num_district_per_warehouse": 10,
     "district_bkt_num": 10,

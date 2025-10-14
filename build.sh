@@ -9,7 +9,7 @@ if [[ -d build ]]; then
 fi
 
 BUILD_TARGET=client
-BUILD_TYPE=Debug
+BUILD_TYPE=Release
 
 while getopts "sd" arg
 do
@@ -19,7 +19,7 @@ do
       BUILD_TARGET="server";
       ;;
     d)
-      BUILD_TYPE=Debug;
+      BUILD_TYPE=Release;
       ;;
     ?)
       echo "unkonw argument"

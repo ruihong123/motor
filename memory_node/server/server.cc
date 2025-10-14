@@ -173,7 +173,7 @@ void Server::LoadData(node_id_t machine_id,
                            ht_size,
                            initfv_size,
                            real_cvt_size);
-  } else if (workload == "SmallBank") {
+  } else if (workload == "SMALLBANK") {
     smallbank_server = new SmallBank();
     smallbank_server->LoadTable(machine_id,
                                 machine_num,
@@ -325,7 +325,7 @@ void Server::PrepareHashMeta(node_id_t machine_id,
   if (workload == "TATP") {
     all_priamry_tables = tatp_server->GetPrimaryHashStore();
     all_backup_tables = tatp_server->GetBackupHashStore();
-  } else if (workload == "SmallBank") {
+  } else if (workload == "SMALLBANK") {
     all_priamry_tables = smallbank_server->GetPrimaryHashStore();
     all_backup_tables = smallbank_server->GetBackupHashStore();
   } else if (workload == "TPCC") {
@@ -335,6 +335,10 @@ void Server::PrepareHashMeta(node_id_t machine_id,
     all_priamry_tables = micro_server->GetPrimaryHashStore();
     all_backup_tables = micro_server->GetBackupHashStore();
   }
+
+  RDMA_LOG(INFO) << "PrepareHashMeta for workload '" << workload << "': found " 
+                 << all_priamry_tables.size() << " primary tables and " 
+                 << all_backup_tables.size() << " backup tables";
 
   for (auto& hash_table : all_priamry_tables) {
     auto* hash_meta = new HashMeta(hash_table->GetTableID(),
@@ -457,14 +461,21 @@ void Server::SendHashMeta(char* hash_meta_buffer, size_t& total_meta_size) {
   RDMA_LOG(INFO) << "Server accepts success";
 
   /* --------------- Sending hash metadata ----------------- */
+  RDMA_LOG(INFO) << "Server: About to send hash metadata, size: " << total_meta_size << " bytes (" 
+                 << (double)total_meta_size / 1024 / 1024 << " MB)";
+  
   auto retlen = send(from_client_socket, hash_meta_buffer, total_meta_size, 0);
+  
   if (retlen < 0) {
     RDMA_LOG(ERROR) << "Server sends hash meta error: " << strerror(errno);
+    RDMA_LOG(ERROR) << "  Error code: " << errno;
+    RDMA_LOG(ERROR) << "  Expected to send: " << total_meta_size << " bytes";
+    RDMA_LOG(ERROR) << "  Actual return value: " << retlen;
     close(from_client_socket);
     close(listen_socket);
     return;
   }
-  RDMA_LOG(INFO) << "Server sends hash meta success";
+  RDMA_LOG(INFO) << "Server sends hash meta success: sent " << retlen << " bytes (expected " << total_meta_size << " bytes)";
 
   size_t recv_ack_size = 100;
   char* recv_buf = (char*)malloc(recv_ack_size);
@@ -641,7 +652,7 @@ void Server::OutputMemoryFootprint(std::string& workload) {
   if (workload == "TATP") {
     all_priamry_tables = tatp_server->GetPrimaryHashStore();
     all_backup_tables = tatp_server->GetBackupHashStore();
-  } else if (workload == "SmallBank") {
+  } else if (workload == "SMALLBANK") {
     all_priamry_tables = smallbank_server->GetPrimaryHashStore();
     all_backup_tables = smallbank_server->GetBackupHashStore();
   } else if (workload == "TPCC") {

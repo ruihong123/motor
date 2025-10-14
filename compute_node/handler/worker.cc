@@ -5,9 +5,12 @@
 
 #include <atomic>
 #include <cstdio>
-#include <fstream>
 #include <functional>
-#include <memory>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <vector>
 
 #include "allocator/buffer_allocator.h"
 #include "connection/qp_manager.h"
@@ -16,6 +19,7 @@
 #include "smallbank/smallbank_txn.h"
 #include "tatp/tatp_txn.h"
 #include "tpcc/tpcc_txn.h"
+#include "util/json_config.h"
 #include "util/latency.h"
 #include "util/zipf.h"
 
@@ -645,9 +649,215 @@ void run_thread(thread_params* params,
   qp_man->BuildQPConnection(meta_man);
 
   // Sync qp connections in one compute node before running transactions
-  connected_t_num += 1;
-  while (connected_t_num != params->running_tnum) {
+  connected_t_num.fetch_add(1);
+  while (connected_t_num < params->running_tnum) {
     usleep(100);  // wait for all threads connections
+  }
+
+  // Cross-node barrier: wait for all compute nodes to be ready (network-based)
+  if (thread_local_id == 0) {
+    // Only thread 0 on each node participates in the cross-node barrier
+    std::string config_filepath = "../../../config/cn_config.json";
+    auto json_config = JsonConfig::load_file(config_filepath);
+    auto conf = json_config.get("local_compute_node");
+    int total_compute_nodes = conf.get("machine_num").get_int64();
+    int barrier_port = conf.get("barrier_port").get_int64();
+    
+    // Get compute node hostnames from config
+    auto compute_nodes = json_config.get("compute_nodes");
+    auto compute_ips = compute_nodes.get("compute_ips");
+    std::string coordinator_ip = compute_ips.get(0).get_str();  // First compute node is coordinator
+    
+    if (meta_man->local_machine_id == 0) {
+      // Node 0 acts as barrier coordinator (server)
+      printf("Node 0: Starting barrier coordinator on port %d for %d nodes...\n", barrier_port, total_compute_nodes);
+      fflush(stdout);
+      RDMA_LOG(INFO) << "Node 0: Starting barrier coordinator on port " << barrier_port 
+                     << " for " << total_compute_nodes << " nodes...";
+      
+      // Create server socket
+      int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+      int on = 1;
+      setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+      
+      struct sockaddr_in server_addr;
+      server_addr.sin_family = AF_INET;
+      server_addr.sin_addr.s_addr = INADDR_ANY;
+      server_addr.sin_port = htons(barrier_port);
+      
+      if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        RDMA_LOG(ERROR) << "Barrier coordinator bind failed: " << strerror(errno);
+        abort();
+      }
+      
+      listen(server_socket, total_compute_nodes);
+      
+      // Accept connections from all OTHER compute nodes (excluding self)
+      std::vector<int> client_sockets;
+      int expected_clients = total_compute_nodes - 1;  // Node 0 doesn't connect to itself
+      
+      printf("Node 0: Waiting for %d client connections...\n", expected_clients);
+      fflush(stdout);
+      
+      for (int i = 0; i < expected_clients; i++) {
+        printf("Node 0: Waiting for connection %d/%d...\n", i+1, expected_clients);
+        fflush(stdout);
+        
+        int client_sock = accept(server_socket, NULL, NULL);
+        if (client_sock < 0) {
+          RDMA_LOG(ERROR) << "Barrier coordinator accept failed: " << strerror(errno);
+          abort();
+        }
+        
+        // Receive ready message
+        char ready_msg[64];
+        int recv_len = recv(client_sock, ready_msg, sizeof(ready_msg), 0);
+        if (recv_len <= 0) {
+          RDMA_LOG(ERROR) << "Failed to receive ready message: " << strerror(errno);
+          close(client_sock);
+          abort();
+        }
+        
+        client_sockets.push_back(client_sock);
+        
+        printf("Node 0: Received ready from client (%d/%d): %s\n", i+1, expected_clients, ready_msg);
+        fflush(stdout);
+        RDMA_LOG(INFO) << "Node 0: Received ready from node (" << (i+1) << "/" << expected_clients << "): " << ready_msg;
+      }
+      
+      RDMA_LOG(INFO) << "Node 0: All " << total_compute_nodes << " nodes ready! Broadcasting start signal...";
+      
+      // Broadcast start signal to all nodes
+      char start_msg[] = "START";
+      for (int sock : client_sockets) {
+        send(sock, start_msg, strlen(start_msg) + 1, 0);
+        close(sock);
+      }
+      
+      close(server_socket);
+      RDMA_LOG(INFO) << "Node 0: Barrier released, starting benchmark...";
+      
+    } else {
+      // Other nodes act as barrier clients
+      printf("Node %d: Connecting to barrier coordinator at %s:%d...\n", 
+             meta_man->local_machine_id, coordinator_ip.c_str(), barrier_port);
+      fflush(stdout);
+      
+      RDMA_LOG(INFO) << "Node " << meta_man->local_machine_id 
+                     << ": Connecting to barrier coordinator at " << coordinator_ip << ":" << barrier_port << "...";
+      
+      struct sockaddr_in server_addr;
+      server_addr.sin_family = AF_INET;
+      server_addr.sin_port = htons(barrier_port);
+      
+      // Resolve hostname/IP from config
+      if (inet_pton(AF_INET, coordinator_ip.c_str(), &server_addr.sin_addr) <= 0) {
+        // Not a valid IP, try to resolve as hostname
+        printf("Node %d: Resolving hostname %s...\n", meta_man->local_machine_id, coordinator_ip.c_str());
+        fflush(stdout);
+        
+        struct hostent* host = gethostbyname(coordinator_ip.c_str());
+        if (host == nullptr) {
+          printf("Node %d: Cannot resolve coordinator hostname: %s\n", meta_man->local_machine_id, coordinator_ip.c_str());
+          fflush(stdout);
+          RDMA_LOG(ERROR) << "Cannot resolve coordinator hostname: " << coordinator_ip;
+          abort();
+        }
+        memcpy(&server_addr.sin_addr, host->h_addr_list[0], host->h_length);
+        
+        char resolved_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &server_addr.sin_addr, resolved_ip, INET_ADDRSTRLEN);
+        printf("Node %d: Resolved %s to %s\n", meta_man->local_machine_id, coordinator_ip.c_str(), resolved_ip);
+        fflush(stdout);
+      }
+      
+      // Connect to coordinator with retries
+      int client_socket = -1;
+      int max_retries = 30;
+      bool first_attempt = true;
+      
+      for (int retry = 0; retry < max_retries; retry++) {
+        if (first_attempt) {
+          printf("Node %d: Attempting connection to coordinator...\n", meta_man->local_machine_id);
+          fflush(stdout);
+          first_attempt = false;
+        }
+        
+        client_socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (client_socket < 0) {
+          printf("Node %d: Failed to create socket: %s\n", meta_man->local_machine_id, strerror(errno));
+          fflush(stdout);
+          sleep(1);
+          continue;
+        }
+        
+        if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+          printf("Node %d: Successfully connected to coordinator!\n", meta_man->local_machine_id);
+          fflush(stdout);
+          break;
+        }
+        
+        printf("Node %d: Connection attempt %d failed: %s\n", meta_man->local_machine_id, retry+1, strerror(errno));
+        fflush(stdout);
+        
+        close(client_socket);
+        client_socket = -1;
+        
+        if (retry == 0) {
+          RDMA_LOG(INFO) << "Node " << meta_man->local_machine_id 
+                         << ": Waiting for coordinator to be ready...";
+        }
+        sleep(1);
+      }
+      
+      if (client_socket < 0) {
+        printf("Node %d: Failed to connect to barrier coordinator after %d retries\n", 
+               meta_man->local_machine_id, max_retries);
+        fflush(stdout);
+        RDMA_LOG(ERROR) << "Node " << meta_man->local_machine_id 
+                        << ": Failed to connect to barrier coordinator after " << max_retries << " retries";
+        abort();
+      }
+      
+      // Send ready message
+      char ready_msg[64];
+      snprintf(ready_msg, sizeof(ready_msg), "READY:%d", meta_man->local_machine_id);
+      int sent = send(client_socket, ready_msg, strlen(ready_msg) + 1, 0);
+      if (sent < 0) {
+        printf("Node %d: Failed to send ready message: %s\n", meta_man->local_machine_id, strerror(errno));
+        fflush(stdout);
+        abort();
+      }
+      
+      printf("Node %d: Sent ready message, waiting for start signal...\n", meta_man->local_machine_id);
+      fflush(stdout);
+      
+      RDMA_LOG(INFO) << "Node " << meta_man->local_machine_id 
+                     << ": Signaled ready, waiting for start signal...";
+      
+      // Wait for start signal
+      char start_msg[64];
+      int recv_len = recv(client_socket, start_msg, sizeof(start_msg), 0);
+      if (recv_len <= 0) {
+        printf("Node %d: Failed to receive start signal: %s\n", meta_man->local_machine_id, strerror(errno));
+        fflush(stdout);
+        abort();
+      }
+      
+      close(client_socket);
+      
+      printf("Node %d: Received start signal, beginning benchmark!\n", meta_man->local_machine_id);
+      fflush(stdout);
+      
+      RDMA_LOG(INFO) << "Node " << meta_man->local_machine_id 
+                     << ": Received start signal, beginning benchmark...";
+    }
+  }
+  
+  // Ensure all threads on this node see that all nodes are ready
+  connected_t_num.fetch_add(1);
+  while (connected_t_num < 2 * params->running_tnum) {
+    usleep(100);
   }
 
   // Start the first coroutine
