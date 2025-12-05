@@ -27,6 +27,13 @@ class TPCC {
 
   uint32_t num_stock_per_warehouse = 100000;
 
+  // Transaction weights (percentages, should sum to 100)
+  uint32_t new_order_weight = 45;
+  uint32_t payment_weight = 43;
+  uint32_t order_status_weight = 4;
+  uint32_t delivery_weight = 4;
+  uint32_t stock_level_weight = 4;
+
   /* Tables */
   HashStore* warehouse_table = nullptr;
 
@@ -66,6 +73,29 @@ class TPCC {
     num_customer_per_district = table_config.get("num_customer_per_district").get_uint64();
     num_item = table_config.get("num_item").get_uint64();
     num_stock_per_warehouse = table_config.get("num_stock_per_warehouse").get_uint64();
+
+    // Load transaction weights from config (optional, defaults to standard TPC-C mix)
+    // Use exists() to check if the field is present, otherwise use default values
+    auto new_order_config = table_config.get("new_order_weight");
+    if (new_order_config.exists()) {
+      new_order_weight = new_order_config.get_uint64();
+    }
+    auto payment_config = table_config.get("payment_weight");
+    if (payment_config.exists()) {
+      payment_weight = payment_config.get_uint64();
+    }
+    auto order_status_config = table_config.get("order_status_weight");
+    if (order_status_config.exists()) {
+      order_status_weight = order_status_config.get_uint64();
+    }
+    auto delivery_config = table_config.get("delivery_weight");
+    if (delivery_config.exists()) {
+      delivery_weight = delivery_config.get_uint64();
+    }
+    auto stock_level_config = table_config.get("stock_level_weight");
+    if (stock_level_config.exists()) {
+      stock_level_weight = stock_level_config.get_uint64();
+    }
   }
 
   ~TPCC() {
@@ -86,22 +116,29 @@ class TPCC {
 
     int i = 0, j = 0;
 
-    j += FREQUENCY_NEW_ORDER;
+    // Use configurable weights instead of hardcoded constants
+    j += new_order_weight;
     for (; i < j; i++) workgen_arr[i] = TPCCTxType::kNewOrder;
 
-    j += FREQUENCY_PAYMENT;
+    j += payment_weight;
     for (; i < j; i++) workgen_arr[i] = TPCCTxType::kPayment;
 
-    j += FREQUENCY_ORDER_STATUS;
+    j += order_status_weight;
     for (; i < j; i++) workgen_arr[i] = TPCCTxType::kOrderStatus;
 
-    j += FREQUENCY_DELIVERY;
+    j += delivery_weight;
     for (; i < j; i++) workgen_arr[i] = TPCCTxType::kDelivery;
 
-    j += FREQUENCY_STOCK_LEVEL;
+    j += stock_level_weight;
     for (; i < j; i++) workgen_arr[i] = TPCCTxType::kStockLevel;
 
-    assert(i == 100 && j == 100);
+    // Ensure we fill exactly 100 slots (weights should sum to 100)
+    // If weights don't sum to 100, pad with the last transaction type
+    while (i < 100) {
+      workgen_arr[i++] = TPCCTxType::kStockLevel;
+    }
+
+    assert(i == 100);
     return workgen_arr;
   }
 

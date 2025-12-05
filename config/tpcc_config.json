@@ -15,6 +15,12 @@
     "num_item": 100000,
     "item_bkt_num": 120000,
     
-    "attempted_num": 50000
+    "attempted_num": 50000,
+
+    "new_order_weight": 45,
+    "payment_weight": 43,
+    "order_status_weight": 4,
+    "delivery_weight": 4,
+    "stock_level_weight": 4
   }
 }
