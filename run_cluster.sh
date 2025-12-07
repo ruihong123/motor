@@ -100,6 +100,35 @@ stop_compute_nodes() {
     log_success "All compute nodes stopped"
 }
 
+# Function to verify all nodes are stopped (for cleanup verification)
+verify_all_nodes_stopped() {
+    log_info "Verifying all nodes are stopped..."
+    local memory_running=0
+    local compute_running=0
+    
+    for node in "${MEMORY_NODES[@]}"; do
+        if ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 $USERNAME@$node "pgrep -f motor_mempool" >/dev/null 2>&1; then
+            log_warning "Memory node $node is still running"
+            memory_running=$((memory_running + 1))
+        fi
+    done
+    
+    for node in "${COMPUTE_NODES[@]}"; do
+        if ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 $USERNAME@$node "pgrep -f './run'" >/dev/null 2>&1; then
+            log_warning "Compute node $node is still running"
+            compute_running=$((compute_running + 1))
+        fi
+    done
+    
+    if [ $memory_running -eq 0 ] && [ $compute_running -eq 0 ]; then
+        log_success "All nodes verified stopped"
+        return 0
+    else
+        log_warning "$memory_running memory node(s) and $compute_running compute node(s) still running"
+        return 1
+    fi
+}
+
 # Function to check if memory nodes are ready
 check_memory_nodes_ready() {
     log_info "Checking if memory nodes are ready..."
@@ -248,6 +277,111 @@ collect_results() {
     done
     
     log_success "Results collected in 'results/' directory"
+    
+    # Aggregate throughput results from all nodes
+    aggregate_results
+}
+
+# Function to aggregate throughput results from all nodes
+aggregate_results() {
+    log_info "Aggregating throughput results from all nodes..."
+    
+    # Find all workload directories
+    local workloads=()
+    for node_dir in results/*_results/bench_results/*/; do
+        if [ -d "$node_dir" ]; then
+            local workload=$(basename "$node_dir")
+            if [[ ! " ${workloads[@]} " =~ " ${workload} " ]]; then
+                workloads+=("$workload")
+            fi
+        fi
+    done
+    
+    if [ ${#workloads[@]} -eq 0 ]; then
+        log_warning "No workload results found to aggregate"
+        return
+    fi
+    
+    # Aggregate results for each workload
+    for workload in "${workloads[@]}"; do
+        log_info "Aggregating results for workload: $workload"
+        
+        local aggregated_file="results/${workload}_aggregated_result.txt"
+        mkdir -p "results"
+        
+        # Initialize aggregated values (using awk for floating point arithmetic)
+        local total_attempted_tp=0
+        local total_committed_tp=0
+        local sum_median_lat=0
+        local max_tail_lat=0
+        local node_count=0
+        local system_name=""
+        
+        # Process each node's result file
+        for node in "${COMPUTE_NODES[@]}"; do
+            local node_result_file="results/${node}_results/bench_results/${workload}/result.txt"
+            
+            if [ -f "$node_result_file" ]; then
+                log_info "  Processing results from $node..."
+                
+                # Read the last line from each node's result file (most recent result)
+                local line=$(tail -n 1 "$node_result_file" 2>/dev/null)
+                
+                if [ -n "$line" ]; then
+                    # Parse: system_name attempted_tp committed_tp median_lat tail_lat
+                    # Use awk to parse and extract values
+                    local sys_name=$(echo "$line" | awk '{print $1}')
+                    local attempted_tp=$(echo "$line" | awk '{print $2}')
+                    local committed_tp=$(echo "$line" | awk '{print $3}')
+                    local median_lat=$(echo "$line" | awk '{print $4}')
+                    local tail_lat=$(echo "$line" | awk '{print $5}')
+                    
+                    # Set system_name from first node (should be same for all)
+                    if [ -z "$system_name" ]; then
+                        system_name="$sys_name"
+                    fi
+                    
+                    # Sum throughputs and latencies using awk for floating point
+                    total_attempted_tp=$(awk "BEGIN {printf \"%.2f\", $total_attempted_tp + $attempted_tp}")
+                    total_committed_tp=$(awk "BEGIN {printf \"%.2f\", $total_committed_tp + $committed_tp}")
+                    sum_median_lat=$(awk "BEGIN {printf \"%.2f\", $sum_median_lat + $median_lat}")
+                    
+                    # Track max tail latency (use awk for comparison)
+                    local is_greater=$(awk "BEGIN {print ($tail_lat > $max_tail_lat) ? 1 : 0}")
+                    if [ "$is_greater" = "1" ]; then
+                        max_tail_lat=$tail_lat
+                    fi
+                    
+                    ((node_count++))
+                fi
+            fi
+        done
+        
+        if [ $node_count -eq 0 ]; then
+            log_warning "  No valid results found for workload $workload"
+            continue
+        fi
+        
+        # Calculate average median latency
+        local avg_median_lat=$(awk "BEGIN {printf \"%.2f\", $sum_median_lat / $node_count}")
+        
+        # Write aggregated result
+        {
+            echo "# Aggregated results from $node_count compute nodes"
+            echo "# Format: system_name attempted_throughput(K_txn/sec) committed_throughput(K_txn/sec) avg_median_latency(us) max_tail_latency(us)"
+            echo "# Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            printf "%-20s %12.2f %12.2f %12.2f %12.2f\n" "$system_name" "$total_attempted_tp" "$total_committed_tp" "$avg_median_lat" "$max_tail_lat"
+        } > "$aggregated_file"
+        
+        log_success "  Aggregated results written to: $aggregated_file"
+        log_info "    Total attempted throughput: ${total_attempted_tp} K txn/sec"
+        log_info "    Total committed throughput: ${total_committed_tp} K txn/sec"
+        log_info "    Average median latency: ${avg_median_lat} us"
+        log_info "    Max tail latency: ${max_tail_lat} us"
+    done
+    
+    log_success "Throughput aggregation completed!"
 }
 
 # Function to show memory node logs
@@ -305,11 +439,15 @@ run_cluster() {
     
     # Stop any existing memory nodes
     stop_memory_nodes
-    sleep 2
     
     # Stop any existing compute nodes
     stop_compute_nodes
-    sleep 1
+    
+    # Verify all nodes are stopped before proceeding
+    if ! verify_all_nodes_stopped; then
+        log_warning "Some nodes may still be running, but proceeding anyway..."
+        sleep 3
+    fi
     
     # Start memory nodes with workload configuration
     if ! start_memory_nodes $workload; then
@@ -323,7 +461,15 @@ run_cluster() {
     # Collect results
     collect_results
     
+    # Clean up: stop all nodes to ensure clean state for next run
+    log_info "Cleaning up after benchmark run..."
+    stop_compute_nodes
+    sleep 1
+    stop_memory_nodes
+    sleep 2
+    
     log_success "Execution completed! Results are in the 'results' directory."
+    log_info "Aggregated throughput results are in 'results/<workload>_aggregated_result.txt'"
 }
 
 # Show usage
@@ -340,9 +486,11 @@ usage() {
     echo ""
     echo "  start-memory [workload] - Start only memory nodes (default: tpcc)"
     echo "  stop-memory     - Stop all memory nodes"
+    echo "  stop-all        - Stop all memory and compute nodes"
     echo "  status          - Show cluster status"
     echo "  logs [node_id]  - Show memory node logs (default: all)"
     echo "  collect         - Collect results from compute nodes"
+    echo "  aggregate       - Aggregate throughput results from all nodes"
     echo "  help            - Show this help message"
     echo ""
     echo "Examples:"
@@ -353,6 +501,8 @@ usage() {
     echo "  $0 start-memory smallbank           # Start memory nodes for SmallBank"
     echo "  $0 status                           # Check status"
     echo "  $0 logs 0                           # Show logs for memory node 0"
+    echo "  $0 collect                          # Collect results from all compute nodes"
+    echo "  $0 aggregate                        # Aggregate throughput from all nodes"
     echo "  $0 stop-memory                      # Stop all memory nodes"
 }
 
@@ -373,6 +523,12 @@ main() {
         "stop-memory")
             stop_memory_nodes
             ;;
+        "stop-all")
+            log_info "Stopping all nodes..."
+            stop_compute_nodes
+            stop_memory_nodes
+            verify_all_nodes_stopped
+            ;;
         "status")
             show_status
             ;;
@@ -381,6 +537,9 @@ main() {
             ;;
         "collect")
             collect_results
+            ;;
+        "aggregate")
+            aggregate_results
             ;;
         "help"|"-h"|"--help")
             usage

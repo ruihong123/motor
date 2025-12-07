@@ -27,16 +27,22 @@ NC='\033[0m' # No Color
 # ============================================================================
 
 # Workloads to test (in order)
-WORKLOADS=("tpcc" "smallbank" "tatp")
+WORKLOADS=("tpcc" "tatp" "smallbank")
 
 # Thread counts to test
-THREAD_COUNTS=(1 8)
+THREAD_COUNTS=(8)
 
 # Coroutine counts to test
-COROUTINE_COUNTS=(2 4)
+COROUTINE_COUNTS=(2)
 
 # Isolation levels to test
-ISOLATION_LEVELS=("SR" "SI")
+ISOLATION_LEVELS=("SR")
+
+# Hot table scanner thread counts to test (0 = disabled, 1+ = enabled with that many threads)
+HOT_SCAN_THREAD_COUNTS=(0 1)
+
+# Debug mode (yes/no) - builds with -g -O0 flags
+DEBUG_MODE="no"
 
 # ============================================================================
 
@@ -155,7 +161,14 @@ sync_flags_h() {
 
 # Function to rebuild all nodes using build_cluster.sh
 rebuild_all_nodes() {
+    local debug_mode=${1:-"no"}
+    
     log_header "REBUILDING ALL NODES"
+    if [ "$debug_mode" == "yes" ]; then
+        log_info "Building in DEBUG mode (with -g -O0 flags)"
+    else
+        log_info "Building in RELEASE mode (with -O3 flags)"
+    fi
     
     if [ ! -f "${PROJECT_DIR}/build_cluster.sh" ]; then
         log_error "build_cluster.sh not found at ${PROJECT_DIR}/build_cluster.sh"
@@ -167,7 +180,7 @@ rebuild_all_nodes() {
     
     # Temporarily disable exit on error to capture build output
     set +e
-    ./build_cluster.sh build all yes > /tmp/build_output.log 2>&1
+    ./build_cluster.sh build all yes "$debug_mode" > /tmp/build_output.log 2>&1
     local build_exit_code=$?
     set -e
     
@@ -221,6 +234,58 @@ rebuild_all_nodes() {
     fi
 }
 
+# Function to update cn_config.json with hot_scan_thread_num
+update_cn_config_hot_scan() {
+    local hot_scan_threads=$1
+    local config_file="${PROJECT_DIR}/config/cn_config.json"
+    
+    log_info "Updating cn_config.json: hot_scan_thread_num = $hot_scan_threads"
+    
+    # Use sed to update the hot_scan_thread_num value
+    # This assumes the line exists in the config file
+    sed -i "s/\"hot_scan_thread_num\": [0-9]*,/\"hot_scan_thread_num\": ${hot_scan_threads},/" "$config_file"
+    
+    log_success "cn_config.json updated: hot_scan_thread_num = $hot_scan_threads"
+}
+
+# Function to sync cn_config.json to all compute nodes
+sync_cn_config() {
+    log_info "Syncing cn_config.json to all compute nodes..."
+    
+    local config_file="${PROJECT_DIR}/config/cn_config.json"
+    local pids=()
+    local failed=0
+    
+    # Sync to all compute nodes in parallel
+    for node in "${COMPUTE_NODES[@]}"; do
+        (
+            scp -q -o ConnectTimeout=30 "$config_file" "$USERNAME@$node:${PROJECT_DIR}/config/cn_config.json" 2>&1
+            if [ $? -ne 0 ]; then
+                echo "FAILED: $node"
+                exit 1
+            fi
+        ) &
+        pids+=($!)
+    done
+    
+    # Wait for all syncs to complete
+    set +e
+    for pid in "${pids[@]}"; do
+        wait $pid
+        if [ $? -ne 0 ]; then
+            failed=$((failed + 1))
+        fi
+    done
+    set -e
+    
+    if [ $failed -gt 0 ]; then
+        log_error "Failed to sync cn_config.json to $failed node(s)"
+        return 1
+    fi
+    
+    log_success "cn_config.json synced to all compute nodes"
+}
+
 # Function to collect results with custom naming
 collect_results_custom() {
     local run_id=$1
@@ -228,9 +293,10 @@ collect_results_custom() {
     local threads=$3
     local coroutines=$4
     local isolation=$5
+    local hot_scan_threads=$6
     
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local result_dir="results/run_${run_id}_${workload}_t${threads}_c${coroutines}_${isolation}_${timestamp}"
+    local result_dir="results/run_${run_id}_${workload}_t${threads}_c${coroutines}_${isolation}_h${hot_scan_threads}_${timestamp}"
     
     log_info "Collecting results to $result_dir..."
     
@@ -365,12 +431,13 @@ EOF
     cat > "$result_dir/README.txt" <<EOF
 This directory contains benchmark results for:
 
-  Benchmark:  $workload
-  Threads:    $threads
-  Coroutines: $coroutines
-  Isolation:  $isolation
-  Run ID:     $run_id
-  Date:       $(date '+%Y-%m-%d %H:%M:%S')
+  Benchmark:      $workload
+  Threads:        $threads
+  Coroutines:    $coroutines
+  Isolation:     $isolation
+  Hot Scan:      $hot_scan_threads threads
+  Run ID:        $run_id
+  Date:          $(date '+%Y-%m-%d %H:%M:%S')
 
 Files in this directory:
   - BENCHMARK_INFO.txt       : Detailed benchmark configuration and metadata
@@ -401,12 +468,27 @@ EOF
     
     # Append this run's info
     cat >> "$summary_file" <<EOF
-Run $run_id: $workload | Threads: $threads | Coroutines: $coroutines | Isolation: $isolation | Time: $timestamp
+Run $run_id: $workload | Threads: $threads | Coroutines: $coroutines | Isolation: $isolation | HotScan: $hot_scan_threads | Time: $timestamp
          Directory: $result_dir
 EOF
     
     # Clean up the standard results directory to avoid confusion
     rm -rf "${PROJECT_DIR}/results/node-"*_results 2>/dev/null || true
+}
+
+# Function to cleanup all nodes (explicit cleanup between runs)
+cleanup_all_nodes() {
+    log_info "Performing explicit cleanup of all nodes..."
+    
+    if [ ! -f "${PROJECT_DIR}/run_cluster.sh" ]; then
+        log_warning "run_cluster.sh not found, skipping cleanup"
+        return 0
+    fi
+    
+    cd "${PROJECT_DIR}"
+    ./run_cluster.sh stop-all 2>/dev/null || true
+    sleep 3
+    log_success "Cleanup completed"
 }
 
 # Function to run a single benchmark
@@ -417,8 +499,24 @@ run_single_benchmark() {
     local threads=$4
     local coroutines=$5
     local isolation=$6
+    local hot_scan_threads=$7
     
-    log_run "RUN $run_id/$total_runs: workload=$workload, threads=$threads, coroutines=$coroutines, isolation=$isolation"
+    log_run "RUN $run_id/$total_runs: workload=$workload, threads=$threads, coroutines=$coroutines, isolation=$isolation, hot_scan=$hot_scan_threads"
+    
+    # Explicit cleanup before each run to ensure clean state
+    cleanup_all_nodes
+    
+    # Update cn_config.json with hot_scan_thread_num
+    if ! update_cn_config_hot_scan "$hot_scan_threads"; then
+        log_error "Failed to update cn_config.json"
+        return 1
+    fi
+    
+    # Sync cn_config.json to all compute nodes
+    if ! sync_cn_config; then
+        log_error "Failed to sync cn_config.json"
+        return 1
+    fi
     
     # Check if run_cluster.sh exists
     if [ ! -f "${PROJECT_DIR}/run_cluster.sh" ]; then
@@ -434,11 +532,13 @@ run_single_benchmark() {
         log_success "Benchmark completed successfully"
     else
         log_error "Benchmark failed"
+        # Cleanup on failure too
+        cleanup_all_nodes
         return 1
     fi
     
     # Collect and organize results
-    collect_results_custom "$run_id" "$workload" "$threads" "$coroutines" "$isolation"
+    collect_results_custom "$run_id" "$workload" "$threads" "$coroutines" "$isolation" "$hot_scan_threads"
     
     log_success "Run $run_id/$total_runs completed!"
 }
@@ -446,7 +546,7 @@ run_single_benchmark() {
 # Function to calculate total number of runs
 calculate_total_runs() {
     local total=0
-    total=$((${#WORKLOADS[@]} * ${#THREAD_COUNTS[@]} * ${#COROUTINE_COUNTS[@]} * ${#ISOLATION_LEVELS[@]}))
+    total=$((${#WORKLOADS[@]} * ${#THREAD_COUNTS[@]} * ${#COROUTINE_COUNTS[@]} * ${#ISOLATION_LEVELS[@]} * ${#HOT_SCAN_THREAD_COUNTS[@]}))
     echo $total
 }
 
@@ -463,7 +563,9 @@ run_benchmark_grid() {
     log_info "  Thread counts: ${THREAD_COUNTS[*]}"
     log_info "  Coroutine counts: ${COROUTINE_COUNTS[*]}"
     log_info "  Isolation levels: ${ISOLATION_LEVELS[*]}"
+    log_info "  Hot scan thread counts: ${HOT_SCAN_THREAD_COUNTS[*]}"
     log_info "  Total runs: $total_runs"
+    log_info "  Debug mode: $DEBUG_MODE"
     
     # Create results directory
     mkdir -p "${PROJECT_DIR}/results"
@@ -487,7 +589,7 @@ run_benchmark_grid() {
                 exit 1
             fi
             
-            if ! rebuild_all_nodes; then
+            if ! rebuild_all_nodes "$DEBUG_MODE"; then
                 log_error "Failed to rebuild nodes"
                 exit 1
             fi
@@ -508,7 +610,7 @@ run_benchmark_grid() {
                 exit 1
             fi
             
-            if ! rebuild_all_nodes; then
+            if ! rebuild_all_nodes "$DEBUG_MODE"; then
                 log_error "Failed to rebuild nodes"
                 exit 1
             fi
@@ -519,7 +621,7 @@ run_benchmark_grid() {
         
         previous_workload="$workload"
         
-        log_info "Starting benchmark runs for $workload (threads: ${THREAD_COUNTS[*]}, coroutines: ${COROUTINE_COUNTS[*]}, isolation: ${ISOLATION_LEVELS[*]})"
+        log_info "Starting benchmark runs for $workload (threads: ${THREAD_COUNTS[*]}, coroutines: ${COROUTINE_COUNTS[*]}, isolation: ${ISOLATION_LEVELS[*]}, hot_scan: ${HOT_SCAN_THREAD_COUNTS[*]})"
         
         for threads in "${THREAD_COUNTS[@]}"; do
             log_info "Processing thread count: $threads"
@@ -527,20 +629,23 @@ run_benchmark_grid() {
                 log_info "  Processing coroutine count: $coroutines"
                 for isolation in "${ISOLATION_LEVELS[@]}"; do
                     log_info "    Processing isolation level: $isolation"
-                    current_run=$((current_run + 1))
-                    
-                    # Run the benchmark
-                    log_info "About to call run_single_benchmark for run $current_run/$total_runs"
-                    if ! run_single_benchmark "$current_run" "$total_runs" "$workload" "$threads" "$coroutines" "$isolation"; then
-                        log_error "Benchmark failed, continuing to next run..."
-                        # Continue instead of exit to run remaining benchmarks
-                    fi
-                    
-                    # Add delay between runs
-                    if [ $current_run -lt $total_runs ]; then
-                        log_info "Waiting 5 seconds before next run..."
-                        sleep 5
-                    fi
+                    for hot_scan_threads in "${HOT_SCAN_THREAD_COUNTS[@]}"; do
+                        log_info "      Processing hot scan thread count: $hot_scan_threads"
+                        current_run=$((current_run + 1))
+                        
+                        # Run the benchmark
+                        log_info "About to call run_single_benchmark for run $current_run/$total_runs"
+                        if ! run_single_benchmark "$current_run" "$total_runs" "$workload" "$threads" "$coroutines" "$isolation" "$hot_scan_threads"; then
+                            log_error "Benchmark failed, continuing to next run..."
+                            # Continue instead of exit to run remaining benchmarks
+                        fi
+                        
+                        # Add delay between runs
+                        if [ $current_run -lt $total_runs ]; then
+                            log_info "Waiting 5 seconds before next run..."
+                            sleep 5
+                        fi
+                    done
                 done
             done
         done
@@ -601,8 +706,21 @@ list_results() {
             local dirname=$(basename "$dir")
             count=$((count + 1))
             
-            # Extract info from directory name
-            if [[ $dirname =~ run_([0-9]+)_([^_]+)_t([0-9]+)_c([0-9]+)_([^_]+)_([0-9_]+) ]]; then
+            # Extract info from directory name (supports both old and new format)
+            if [[ $dirname =~ run_([0-9]+)_([^_]+)_t([0-9]+)_c([0-9]+)_([^_]+)_h([0-9]+)_([0-9_]+) ]]; then
+                # New format with hot_scan
+                local run_id="${BASH_REMATCH[1]}"
+                local workload="${BASH_REMATCH[2]}"
+                local threads="${BASH_REMATCH[3]}"
+                local coroutines="${BASH_REMATCH[4]}"
+                local isolation="${BASH_REMATCH[5]}"
+                local hot_scan="${BASH_REMATCH[6]}"
+                local timestamp="${BASH_REMATCH[7]}"
+                
+                printf "%3d. %-50s | %s t:%2s c:%2s iso:%-2s h:%2s\n" \
+                    "$run_id" "$dirname" "$workload" "$threads" "$coroutines" "$isolation" "$hot_scan"
+            elif [[ $dirname =~ run_([0-9]+)_([^_]+)_t([0-9]+)_c([0-9]+)_([^_]+)_([0-9_]+) ]]; then
+                # Old format without hot_scan
                 local run_id="${BASH_REMATCH[1]}"
                 local workload="${BASH_REMATCH[2]}"
                 local threads="${BASH_REMATCH[3]}"
@@ -610,7 +728,7 @@ list_results() {
                 local isolation="${BASH_REMATCH[5]}"
                 local timestamp="${BASH_REMATCH[6]}"
                 
-                printf "%3d. %-50s | %s t:%2s c:%2s iso:%s\n" \
+                printf "%3d. %-50s | %s t:%2s c:%2s iso:%s h:--\n" \
                     "$run_id" "$dirname" "$workload" "$threads" "$coroutines" "$isolation"
                 
                 # Show README snippet if available
@@ -662,9 +780,11 @@ dry_run() {
         for threads in "${THREAD_COUNTS[@]}"; do
             for coroutines in "${COROUTINE_COUNTS[@]}"; do
                 for isolation in "${ISOLATION_LEVELS[@]}"; do
-                    current_run=$((current_run + 1))
-                    printf "%3d/%d: workload=%-10s threads=%-3d coroutines=%-2d isolation=%s\n" \
-                        $current_run $total_runs "$workload" $threads $coroutines "$isolation"
+                    for hot_scan_threads in "${HOT_SCAN_THREAD_COUNTS[@]}"; do
+                        current_run=$((current_run + 1))
+                        printf "%3d/%d: workload=%-10s threads=%-3d coroutines=%-2d isolation=%-2s hot_scan=%-2d\n" \
+                            $current_run $total_runs "$workload" $threads $coroutines "$isolation" $hot_scan_threads
+                    done
                 done
             done
         done
@@ -677,7 +797,7 @@ dry_run() {
 # Show usage
 usage() {
     cat <<EOF
-Usage: $0 [command]
+Usage: $0 [command] [--debug]
 
 Commands:
   run        - Execute the benchmark grid
@@ -686,6 +806,9 @@ Commands:
   list       - List all result directories with details
   help       - Show this help message
 
+Options:
+  --debug    - Build in DEBUG mode (with -g -O0 flags) instead of RELEASE mode
+
 Configuration:
   Edit the arrays at the top of this script to customize the benchmark grid:
   
@@ -693,12 +816,16 @@ Configuration:
   THREAD_COUNTS      - Array of thread counts per compute node
   COROUTINE_COUNTS   - Array of coroutine counts per thread
   ISOLATION_LEVELS   - Array of isolation levels (SI, SR)
+  HOT_SCAN_THREAD_COUNTS - Array of hot table scanner thread counts (0 = disabled, 1+ = enabled)
+  DEBUG_MODE         - Set to "yes" to build in DEBUG mode by default
 
 Current Configuration:
   Workloads:         ${WORKLOADS[*]}
   Thread counts:     ${THREAD_COUNTS[*]}
   Coroutine counts:  ${COROUTINE_COUNTS[*]}
   Isolation levels:  ${ISOLATION_LEVELS[*]}
+  Hot scan threads:  ${HOT_SCAN_THREAD_COUNTS[*]}
+  Debug mode:        $DEBUG_MODE
   Total runs:        $(calculate_total_runs)
 
 Features:
@@ -709,10 +836,11 @@ Features:
   - Supports dry-run to preview execution plan
 
 Examples:
-  $0 dry-run     # Preview what will be executed
-  $0 run         # Execute the benchmark grid
-  $0 summary     # View summary of completed runs
-  $0 list        # List all result directories
+  $0 dry-run           # Preview what will be executed
+  $0 run               # Execute the benchmark grid (RELEASE mode)
+  $0 run --debug       # Execute the benchmark grid (DEBUG mode)
+  $0 summary           # View summary of completed runs
+  $0 list              # List all result directories
 
 Result Organization:
   - Main results directory: ${PROJECT_DIR}/results/
@@ -735,7 +863,20 @@ EOF
 
 # Main entry point
 main() {
-    case "${1:-help}" in
+    # Parse command line arguments
+    local command="help"
+    
+    # Check for --debug flag and find the actual command
+    for arg in "$@"; do
+        if [ "$arg" == "--debug" ]; then
+            DEBUG_MODE="yes"
+        elif [ "$command" == "help" ] && [ "$arg" != "--debug" ]; then
+            # First non-debug argument is the command
+            command="$arg"
+        fi
+    done
+    
+    case "$command" in
         "run")
             run_benchmark_grid
             ;;

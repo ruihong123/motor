@@ -7,7 +7,7 @@
     "use_pm": 0,
     "pm_root": "/dev/dax0.1",
     "reserve_GB": 50,
-    "max_client_num_per_mn": 64,
+    "max_client_num_per_mn": 72,
     "per_thread_delta_size_MB": 80,
     "workload": "TPCC"
   },

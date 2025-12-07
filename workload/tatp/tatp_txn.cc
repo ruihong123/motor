@@ -4,6 +4,7 @@
 #include "tatp/tatp_txn.h"
 
 #include <atomic>
+#include <cmath>
 
 /******************** The business logic (Transaction) start ********************/
 
@@ -105,9 +106,10 @@ bool TxGetNewDestination(TATP* tatp_client,
                                                       callfwd_key[i].item_key,
                                                       UserOP::kRead);
     txn->AddToReadOnlySet(callfwd_record[i]);
+    if (!txn->Execute(yield)) return false;
   }
 
-  if (!txn->Execute(yield)) return false;
+  
 
   bool callfwd_success = false;
 
@@ -194,7 +196,8 @@ bool TxUpdateSubscriberData(TATP* tatp_client,
                                                   sub_key.item_key,
                                                   UserOP::kUpdate);
   txn->AddToReadWriteSet(sub_record);
-
+  if (!txn->Execute(yield)) return false;
+  
   /* Read + lock the special facilty record */
   tatp_specfac_key_t specfac_key;
   specfac_key.s_id = s_id;
@@ -434,6 +437,141 @@ bool TxDeleteCallForwarding(TATP* tatp_client,
 
   bool commit_status = txn->Commit(yield);
   return commit_status;
+}
+
+// Long-running scan transaction for hot table scanner
+// Scans multiple subscribers, access_info, and special_facility records
+bool TxHotTableScan(TATP* tatp_client,
+                    coro_yield_t& yield,
+                    tx_id_t tx_id,
+                    TXN* txn,
+                    uint32_t& current_user_start,
+                    uint32_t& current_user,
+                    uint8_t& current_ai_type,
+                    uint8_t& current_sf_type,
+                    int& scan_table,
+                    bool& in_scan) {
+  // Constants for hot scan configuration
+  const double HOT_SCAN_USER_PERCENTAGE = 0.001;  // 0.1% of users per scan
+  const uint32_t global_total_subscribers = tatp_client->subscriber_size;
+  const uint8_t AI_TYPE_MIN = 1;
+  const uint8_t AI_TYPE_MAX = 4;
+  const uint8_t SF_TYPE_MIN = 1;
+  const uint8_t SF_TYPE_MAX = 4;
+  
+  // Calculate number of users to scan per transaction
+  const uint32_t users_per_scan = std::max(static_cast<uint32_t>(1), 
+                                           static_cast<uint32_t>(std::ceil(global_total_subscribers * HOT_SCAN_USER_PERCENTAGE)));
+  
+  if (!in_scan) {
+    // Start a new scan batch
+    in_scan = true;
+    current_user = current_user_start;
+    current_ai_type = AI_TYPE_MIN;
+    current_sf_type = SF_TYPE_MIN;
+    scan_table = 0;  // Start with access_info
+    txn->Begin(tx_id, TXN_TYPE::kROTxn, "HotTableScan");
+  }
+  
+  // Scan all data for users in current batch
+  switch (scan_table) {
+    case 0: { // Scan access_info
+      uint32_t sub = current_user;
+      uint8_t ai_type = current_ai_type;
+      
+      // Read access_info record
+      tatp_accinf_key_t key;
+      key.s_id = sub;
+      key.ai_type = ai_type;
+      auto acc_record = std::make_shared<DataSetItem>((table_id_t)TATPTableType::kAccessInfoTable,
+                                                       tatp_accinf_val_t_size,
+                                                       key.item_key,
+                                                       UserOP::kRead);
+      txn->AddToReadOnlySet(acc_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next access_info type
+      ++ai_type;
+      if (ai_type > AI_TYPE_MAX) {
+        // Finished all access_info for current user, move to next user
+        ai_type = AI_TYPE_MIN;
+        ++sub;
+        // Check if we've exceeded the batch or global total
+        uint32_t batch_end = current_user_start + users_per_scan - 1;
+        if (sub > batch_end || sub >= global_total_subscribers) {
+          // Finished all access_info for all users in batch, switch to special_facility
+          scan_table = 1;
+          current_user = current_user_start;
+          current_sf_type = SF_TYPE_MIN;
+        } else {
+          current_user = sub;
+        }
+        current_ai_type = ai_type;
+      } else {
+        current_ai_type = ai_type;
+      }
+      break;
+    }
+    case 1: { // Scan special_facility
+      uint32_t sub = current_user;
+      uint8_t sf_type = current_sf_type;
+      
+      // Read special_facility record
+      tatp_specfac_key_t specfac_key;
+      specfac_key.s_id = sub;
+      specfac_key.sf_type = sf_type;
+      auto specfac_record = std::make_shared<DataSetItem>((table_id_t)TATPTableType::kSpecialFacilityTable,
+                                                           tatp_specfac_val_t_size,
+                                                           specfac_key.item_key,
+                                                           UserOP::kRead);
+      txn->AddToReadOnlySet(specfac_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next special_facility type
+      ++sf_type;
+      if (sf_type > SF_TYPE_MAX) {
+        // Finished all special_facility for current user, move to next user
+        sf_type = SF_TYPE_MIN;
+        ++sub;
+        // Check if we've exceeded the batch or global total
+        uint32_t batch_end = current_user_start + users_per_scan - 1;
+        if (sub > batch_end || sub >= global_total_subscribers) {
+          // Finished scanning all data for all users in batch
+          // Commit transaction
+          bool committed = txn->Commit(yield);
+          if (committed) {
+            in_scan = false;
+            // Move to next batch of users (round-robin globally)
+            current_user_start += users_per_scan;
+            if (current_user_start >= global_total_subscribers) {
+              // Wrap around: start from 0 (first subscriber globally)
+              current_user_start = 0;
+            }
+            return true; // Transaction committed
+          } else {
+            in_scan = false;
+            return false; // Transaction aborted
+          }
+        } else {
+          current_user = sub;
+        }
+        current_sf_type = sf_type;
+      } else {
+        current_sf_type = sf_type;
+      }
+      break;
+    }
+  }
+  
+  return true; // Continue scanning
 }
 
 /******************** The business logic (Transaction) end ********************/

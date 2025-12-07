@@ -15,11 +15,33 @@
 #include "process/oplog.h"
 #include "process/stat.h"
 #include "util/json_config.h"
+#include "allocator/buffer_allocator.h"
+#include "allocator/region_allocator.h"
+#include "cache/addr_cache.h"
+
+// Forward declaration
+void HotTableScannerThread(std::string bench_name,
+                           TATP* tatp_cli,
+                           SmallBank* smallbank_cli,
+                           TPCC* tpcc_cli,
+                           MetaManager* meta_man,
+                           t_id_t thread_gid,
+                           LocalBufferAllocator* rdma_buffer_allocator,
+                           RemoteDeltaOffsetAllocator* delta_offset_allocator,
+                           LockedKeyTable* locked_key_table,
+                           AddrCache* addr_cache);
 
 ///////////// For control and statistics ///////////////
 std::atomic<uint64_t> tx_id_generator;
 std::atomic<uint64_t> connected_t_num;
 std::atomic<uint64_t> connected_recovery_t_num;
+
+// Hot table scanner control (declared in worker.cc, used here)
+extern std::atomic<uint64_t> hot_scan_committed_total;
+extern std::atomic<uint64_t> hot_scan_aborted_total;
+extern std::atomic<bool> hot_scan_should_run;
+extern std::atomic<int> hot_scan_threads_started;
+extern std::atomic<int> hot_scan_threads_ready;
 
 std::vector<t_id_t> tid_vec;
 std::vector<double> attemp_tp_vec;
@@ -74,6 +96,14 @@ void Handler::GenThreads(std::string bench_name) {
   node_id_t machine_id = (node_id_t)client_conf.get("machine_id").get_int64();
   t_id_t thread_num_per_machine = (t_id_t)client_conf.get("thread_num_per_machine").get_int64();
   const int coro_num = (int)client_conf.get("coroutine_num").get_int64();
+  
+  // Get hot table scanner thread configuration
+  int hot_scan_thread_num = 0;
+  auto hot_scan_config = client_conf.get("hot_scan_thread_num");
+  if (hot_scan_config.exists()) {
+    hot_scan_thread_num = (int)hot_scan_config.get_int64();
+  }
+  
   int crash_tnum = 0;
 
 #if HAVE_COORD_CRASH
@@ -132,12 +162,14 @@ void Handler::GenThreads(std::string bench_name) {
   auto thread_arr = new std::thread[thread_num_per_machine];
 
   auto* global_meta_man = new MetaManager();
-  RDMA_LOG(INFO) << "Alloc local memory: " << (size_t)(thread_num_per_machine * PER_THREAD_ALLOC_SIZE) / (1024 * 1024) << " MB. Waiting...";
-  auto* global_rdma_region = new LocalRegionAllocator(global_meta_man, thread_num_per_machine);
+  // Allocate memory for normal threads + hot scanner threads
+  t_id_t total_threads = thread_num_per_machine + hot_scan_thread_num;
+  RDMA_LOG(INFO) << "Alloc local memory: " << (size_t)(total_threads * PER_THREAD_ALLOC_SIZE) / (1024 * 1024) << " MB. Waiting...";
+  auto* global_rdma_region = new LocalRegionAllocator(global_meta_man, total_threads);
 
   auto* global_delta_region = new RemoteDeltaRegionAllocator(global_meta_man, global_meta_man->remote_nodes);
 
-  auto* global_locked_key_table = new LockedKeyTable[thread_num_per_machine * coro_num];
+  auto* global_locked_key_table = new LockedKeyTable[total_threads * coro_num];
 
   auto* param_arr = new struct thread_params[thread_num_per_machine];
 
@@ -164,6 +196,65 @@ void Handler::GenThreads(std::string bench_name) {
 
   RDMA_LOG(INFO) << "Running on isolation level: " << global_meta_man->iso_level;
   RDMA_LOG(INFO) << "Executing...";
+  
+  // Initialize hot table scanner if enabled
+  std::vector<std::thread> hot_scan_threads;
+  if (hot_scan_thread_num > 0) {
+    hot_scan_should_run.store(false, std::memory_order_release);
+    hot_scan_committed_total.store(0, std::memory_order_relaxed);
+    hot_scan_aborted_total.store(0, std::memory_order_relaxed);
+    hot_scan_threads_started.store(0, std::memory_order_relaxed);
+    hot_scan_threads_ready.store(0, std::memory_order_relaxed);
+    
+    // Allocate resources for hot table scanner threads
+    // Use thread IDs beyond normal transaction threads to avoid conflicts
+    // Global thread ID = machine_id * thread_num_per_machine + thread_num_per_machine + i
+    t_id_t base_scanner_global_id = machine_id * thread_num_per_machine + thread_num_per_machine;
+    // Local thread ID within this machine (for resource allocation)
+    t_id_t base_scanner_local_id = thread_num_per_machine;
+    
+    for (int i = 0; i < hot_scan_thread_num; i++) {
+      t_id_t scanner_global_id = base_scanner_global_id + i;
+      t_id_t scanner_local_id = base_scanner_local_id + i;
+      
+      // Allocate resources for this scanner thread
+      LocalBufferAllocator* scanner_rdma_allocator = nullptr;
+      RemoteDeltaOffsetAllocator* scanner_delta_allocator = nullptr;
+      LockedKeyTable* scanner_locked_table = nullptr;
+      AddrCache* scanner_addr_cache = nullptr;
+      
+      // Allocate RDMA buffer using local thread ID
+      auto alloc_rdma_region_range = global_rdma_region->GetThreadLocalRegion(scanner_local_id);
+      scanner_rdma_allocator = new LocalBufferAllocator(alloc_rdma_region_range.first, alloc_rdma_region_range.second);
+      
+      // Allocate delta region using global thread ID
+      std::unordered_map<node_id_t, DeltaRange> scanner_delta_region;
+      global_delta_region->GetThreadDeltaRegion(scanner_global_id, scanner_delta_region);
+      scanner_delta_allocator = new RemoteDeltaOffsetAllocator(scanner_delta_region);
+      
+      // Allocate locked key table (use a slot beyond normal threads)
+      char* p = (char*)(global_locked_key_table);
+      p += sizeof(LockedKeyTable) * scanner_local_id * coro_num;
+      scanner_locked_table = (LockedKeyTable*)p;
+      
+      // Create addr cache for scanner thread
+      scanner_addr_cache = new AddrCache();
+      
+      hot_scan_threads.push_back(std::thread(HotTableScannerThread,
+                                             bench_name,
+                                             tatp_client,
+                                             smallbank_client,
+                                             tpcc_client,
+                                             global_meta_man,
+                                             scanner_global_id,
+                                             scanner_rdma_allocator,
+                                             scanner_delta_allocator,
+                                             scanner_locked_table,
+                                             scanner_addr_cache));
+      
+      RDMA_LOG(INFO) << "Started hot table scanner thread " << i << " with global_id " << scanner_global_id << " and local_id " << scanner_local_id;
+    }
+  }
 
   for (t_id_t i = 0; i < thread_num_per_machine - crash_tnum; i++) {
     param_arr[i].thread_local_id = i;
@@ -282,10 +373,22 @@ void Handler::GenThreads(std::string bench_name) {
   }
 #endif
 
+  // Stop hot table scanner threads if enabled
+  if (hot_scan_thread_num > 0) {
+    hot_scan_should_run.store(false, std::memory_order_release);
+  }
+  
   for (t_id_t i = 0; i < thread_num_per_machine; i++) {
     if (thread_arr[i].joinable()) {
       thread_arr[i].join();
       // RDMA_LOG(INFO) << "Thread " << i << " joins";
+    }
+  }
+  
+  // Wait for hot table scanner threads to finish
+  for (auto& thread : hot_scan_threads) {
+    if (thread.joinable()) {
+      thread.join();
     }
   }
 

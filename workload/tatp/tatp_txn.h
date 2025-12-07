@@ -65,4 +65,17 @@ bool TxDeleteCallForwarding(TATP* tatp_client,
                             tx_id_t tx_id,
                             TXN* txn);
 
+// Long-running scan transaction for hot table scanner
+// Scans multiple subscribers, access_info, and special_facility records
+bool TxHotTableScan(TATP* tatp_client,
+                    coro_yield_t& yield,
+                    tx_id_t tx_id,
+                    TXN* txn,
+                    uint32_t& current_user_start,
+                    uint32_t& current_user,
+                    uint8_t& current_ai_type,
+                    uint8_t& current_sf_type,
+                    int& scan_table,
+                    bool& in_scan);
+
 /******************** The business logic (Transaction) end ********************/

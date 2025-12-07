@@ -3,6 +3,8 @@
 
 #include "smallbank/smallbank_txn.h"
 
+#include <cmath>
+
 /******************** The business logic (Transaction) start ********************/
 
 bool TxAmalgamate(SmallBank* smallbank_client,
@@ -301,6 +303,112 @@ bool TxWriteCheck(SmallBank* smallbank_client,
 
   bool commit_status = txn->Commit(yield);
   return commit_status;
+}
+
+// Long-running scan transaction for hot table scanner
+// Scans multiple accounts from savings and checking tables
+bool TxHotTableScan(SmallBank* smallbank_client,
+                    coro_yield_t& yield,
+                    tx_id_t tx_id,
+                    TXN* txn,
+                    uint64_t& current_user_start,
+                    uint64_t& current_user,
+                    int& scan_table,
+                    bool& in_scan) {
+  // Constants for hot scan configuration
+  const double HOT_SCAN_USER_PERCENTAGE = 0.001;  // 0.1% of users per scan
+  const uint64_t global_total_accounts = smallbank_client->num_accounts_global;
+  
+  // Calculate number of users to scan per transaction
+  const uint64_t users_per_scan = std::max(static_cast<uint64_t>(1), 
+                                           static_cast<uint64_t>(std::ceil(global_total_accounts * HOT_SCAN_USER_PERCENTAGE)));
+  
+  if (!in_scan) {
+    // Start a new scan batch
+    in_scan = true;
+    current_user = current_user_start;
+    scan_table = 0;  // Start with savings
+    txn->Begin(tx_id, TXN_TYPE::kROTxn, "HotTableScan");
+  }
+  
+  // Scan all data for users in current batch
+  switch (scan_table) {
+    case 0: { // Scan savings
+      uint64_t cust = current_user;
+      
+      // Read savings record
+      smallbank_savings_key_t sav_key;
+      sav_key.acct_id = cust;
+      auto sav_record = std::make_shared<DataSetItem>((table_id_t)SmallBankTableType::kSavingsTable,
+                                                       smallbank_savings_val_t_size,
+                                                       sav_key.item_key,
+                                                       UserOP::kRead);
+      txn->AddToReadOnlySet(sav_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next user
+      ++cust;
+      // Check if we've exceeded the batch or global total
+      uint64_t batch_end = current_user_start + users_per_scan - 1;
+      if (cust > batch_end || cust >= global_total_accounts) {
+        // Finished all savings for all users in batch, switch to checking
+        scan_table = 1;
+        current_user = current_user_start;
+      } else {
+        current_user = cust;
+      }
+      break;
+    }
+    case 1: { // Scan checking
+      uint64_t cust = current_user;
+      
+      // Read checking record
+      smallbank_checking_key_t chk_key;
+      chk_key.acct_id = cust;
+      auto chk_record = std::make_shared<DataSetItem>((table_id_t)SmallBankTableType::kCheckingTable,
+                                                       smallbank_checking_val_t_size,
+                                                       chk_key.item_key,
+                                                       UserOP::kRead);
+      txn->AddToReadOnlySet(chk_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next user
+      ++cust;
+      // Check if we've exceeded the batch or global total
+      uint64_t batch_end = current_user_start + users_per_scan - 1;
+      if (cust > batch_end || cust >= global_total_accounts) {
+        // Finished scanning all data for all users in batch
+        // Commit transaction
+        bool committed = txn->Commit(yield);
+        if (committed) {
+          in_scan = false;
+          // Move to next batch of users (round-robin globally)
+          current_user_start += users_per_scan;
+          if (current_user_start >= global_total_accounts) {
+            // Wrap around: start from 0 (first account globally)
+            current_user_start = 0;
+          }
+          return true; // Transaction committed
+        } else {
+          in_scan = false;
+          return false; // Transaction aborted
+        }
+      } else {
+        current_user = cust;
+      }
+      break;
+    }
+  }
+  
+  return true; // Continue scanning
 }
 
 /******************** The business logic (Transaction) end ********************/

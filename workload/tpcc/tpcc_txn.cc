@@ -4,6 +4,7 @@
 #include "tpcc/tpcc_txn.h"
 
 #include <atomic>
+#include <cmath>
 
 /******************** The business logic (Transaction) start ********************/
 
@@ -918,6 +919,222 @@ bool TxStockLevel(TPCC* tpcc_client,
 
   bool commit_status = txn->Commit(yield);
   return commit_status;
+}
+
+// Long-running scan transaction for hot table scanner
+// Scans multiple warehouses, districts, customers, and stock items
+// Based on MemoryEngine's hot table scanner implementation
+bool TxHotTableScan(TPCC* tpcc_client,
+                    coro_yield_t& yield,
+                    tx_id_t tx_id,
+                    TXN* txn,
+                    int& current_warehouse_start,
+                    int& current_warehouse,
+                    int& current_district,
+                    int& current_customer,
+                    int& current_item,
+                    int& scan_phase,
+                    bool& in_scan) {
+  // Constants for hot scan configuration
+  const double HOT_SCAN_WAREHOUSE_PERCENTAGE = 0.01;  // 1% of warehouses per scan
+  const int global_total_warehouses = tpcc_client->num_warehouse;
+  const int max_district = tpcc_client->num_district_per_warehouse;
+  const int max_customer = tpcc_client->num_customer_per_district;
+  const int max_items = tpcc_client->num_item;
+  
+  // Calculate number of warehouses to scan per transaction
+  const int warehouses_per_scan = std::max(1, static_cast<int>(std::ceil(global_total_warehouses * HOT_SCAN_WAREHOUSE_PERCENTAGE)));
+  
+  if (!in_scan) {
+    // Start a new scan batch
+    in_scan = true;
+    current_warehouse = current_warehouse_start;
+    current_district = 1;
+    current_customer = 1;
+    current_item = 1;
+    scan_phase = 0;  // Start with districts
+    txn->Begin(tx_id, TXN_TYPE::kROTxn, "HotTableScan");
+  }
+  
+  // Scan all data for warehouses in current batch
+  switch (scan_phase) {
+    case 0: { // Scan districts
+      int wh = current_warehouse;
+      int d = current_district;
+      
+      // Read district record
+      uint64_t d_key = tpcc_client->MakeDistrictKey(wh, d);
+      tpcc_district_key_t dist_key;
+      dist_key.d_id = d_key;
+      auto dist_record = std::make_shared<DataSetItem>((table_id_t)TPCCTableType::kDistrictTable,
+                                                         tpcc_district_val_t_size,
+                                                         dist_key.item_key,
+                                                         UserOP::kRead);
+      txn->AddToReadOnlySet(dist_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next district
+      ++d;
+      if (d > max_district) {
+        // Finished all districts for current warehouse, move to next warehouse
+        d = 1;
+        ++wh;
+        // Check if we've exceeded the batch or global total
+        int batch_end = current_warehouse_start + warehouses_per_scan - 1;
+        if (wh > batch_end || wh > global_total_warehouses) {
+          // Finished all districts for all warehouses in batch, move to stock phase
+          scan_phase = 1;
+          current_warehouse = current_warehouse_start;
+          current_item = 1;
+        } else {
+          current_warehouse = wh;
+        }
+        current_district = d;
+      } else {
+        current_district = d;
+      }
+      break;
+    }
+    case 1: { // Scan stock
+      int wh = current_warehouse;
+      int item = current_item;
+      
+      // Read stock record
+      int64_t s_key = tpcc_client->MakeStockKey(wh, item);
+      tpcc_stock_key_t stock_key;
+      stock_key.s_id = s_key;
+      auto stock_record = std::make_shared<DataSetItem>((table_id_t)TPCCTableType::kStockTable,
+                                                          tpcc_stock_val_t_size,
+                                                          stock_key.item_key,
+                                                          UserOP::kRead);
+      txn->AddToReadOnlySet(stock_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next item
+      ++item;
+      if (item > max_items) {
+        // Finished all items for current warehouse, move to next warehouse
+        item = 1;
+        ++wh;
+        // Check if we've exceeded the batch or global total
+        int batch_end = current_warehouse_start + warehouses_per_scan - 1;
+        if (wh > batch_end || wh > global_total_warehouses) {
+          // Finished all stock for all warehouses in batch, move to warehouse phase
+          scan_phase = 2;
+          current_warehouse = current_warehouse_start;
+        } else {
+          current_warehouse = wh;
+        }
+        current_item = item;
+      } else {
+        current_item = item;
+      }
+      break;
+    }
+    case 2: { // Scan warehouses
+      int wh = current_warehouse;
+      
+      // Read warehouse record
+      tpcc_warehouse_key_t ware_key;
+      ware_key.w_id = wh;
+      auto ware_record = std::make_shared<DataSetItem>((table_id_t)TPCCTableType::kWarehouseTable,
+                                                       tpcc_warehouse_val_t_size,
+                                                       ware_key.item_key,
+                                                       UserOP::kRead);
+      txn->AddToReadOnlySet(ware_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next warehouse
+      ++wh;
+      // Check if we've exceeded the batch or global total
+      int batch_end = current_warehouse_start + warehouses_per_scan - 1;
+      if (wh > batch_end || wh > global_total_warehouses) {
+        // Finished all warehouses in batch, move to customer phase
+        scan_phase = 3;
+        current_warehouse = current_warehouse_start;
+        current_district = 1;
+        current_customer = 1;
+      } else {
+        current_warehouse = wh;
+      }
+      break;
+    }
+    case 3: { // Scan customers
+      int wh = current_warehouse;
+      int d = current_district;
+      int c = current_customer;
+      
+      // Read customer record
+      int64_t c_key = tpcc_client->MakeCustomerKey(wh, d, c);
+      tpcc_customer_key_t cust_key;
+      cust_key.c_id = c_key;
+      auto cust_record = std::make_shared<DataSetItem>((table_id_t)TPCCTableType::kCustomerTable,
+                                                        tpcc_customer_val_t_size,
+                                                        cust_key.item_key,
+                                                        UserOP::kRead);
+      txn->AddToReadOnlySet(cust_record);
+      
+      if (!txn->Execute(yield)) {
+        in_scan = false;
+        return false; // Transaction aborted
+      }
+      
+      // Advance to next customer
+      ++c;
+      if (c > max_customer) {
+        // Finished all customers for current district, move to next district
+        c = 1;
+        ++d;
+        if (d > max_district) {
+          // Finished all districts for current warehouse, move to next warehouse
+          d = 1;
+          ++wh;
+          // Check if we've exceeded the batch or global total
+          int batch_end = current_warehouse_start + warehouses_per_scan - 1;
+          if (wh > batch_end || wh > global_total_warehouses) {
+            // Finished scanning all data for all warehouses in batch
+            // Commit transaction
+            bool committed = txn->Commit(yield);
+            if (committed) {
+              in_scan = false;
+              // Move to next batch of warehouses (round-robin globally)
+              current_warehouse_start += warehouses_per_scan;
+              if (current_warehouse_start > global_total_warehouses) {
+                // Wrap around: start from 1 (first warehouse globally)
+                current_warehouse_start = 1;
+              }
+              return true; // Transaction committed
+            } else {
+              in_scan = false;
+              return false; // Transaction aborted
+            }
+          } else {
+            current_warehouse = wh;
+          }
+        } else {
+          current_district = d;
+        }
+        current_customer = c;
+      } else {
+        current_customer = c;
+      }
+      break;
+    }
+  }
+  
+  return true; // Continue scanning
 }
 
 /******************** The business logic (Transaction) end ********************/

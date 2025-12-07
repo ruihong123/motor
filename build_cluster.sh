@@ -50,16 +50,24 @@ check_node_connectivity() {
 build_on_node() {
     local node=$1
     local build_type=$2  # "server" for memory nodes, "client" for compute nodes
+    local debug_mode=$3  # "yes" for Debug build, "no" for Release build (default)
     
-    log_info "Building Motor on $node (type: $build_type)..."
-    
-    if [ "$build_type" == "server" ]; then
-        ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "cd $PROJECT_DIR && ./build.sh -s" 2>&1 | tail -n 5
-        local build_exit_code=${PIPESTATUS[0]}
+    if [ "$debug_mode" == "yes" ]; then
+        log_info "Building Motor on $node (type: $build_type, mode: DEBUG)..."
     else
-        ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "cd $PROJECT_DIR && ./build.sh" 2>&1 | tail -n 5
-        local build_exit_code=${PIPESTATUS[0]}
+        log_info "Building Motor on $node (type: $build_type, mode: RELEASE)..."
     fi
+    
+    local build_cmd="./build.sh"
+    if [ "$build_type" == "server" ]; then
+        build_cmd="$build_cmd -s"
+    fi
+    if [ "$debug_mode" == "yes" ]; then
+        build_cmd="$build_cmd -d"
+    fi
+    
+    ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "cd $PROJECT_DIR && $build_cmd" 2>&1 | tail -n 5
+    local build_exit_code=${PIPESTATUS[0]}
     
     if [ $build_exit_code -eq 0 ]; then
         log_success "Build completed on $node"
@@ -82,14 +90,15 @@ clean_on_node() {
 # Function to build all nodes in parallel
 build_all_parallel() {
     local build_type=$1  # "server" or "client"
-    local nodes=("${@:2}")  # All remaining arguments are nodes
+    local debug_mode=$2  # "yes" or "no" for debug build
+    local nodes=("${@:3}")  # All remaining arguments are nodes
     
     local pids=()
     local failed_nodes=()
     
     # Start builds in parallel
     for node in "${nodes[@]}"; do
-        build_on_node "$node" "$build_type" &
+        build_on_node "$node" "$build_type" "$debug_mode" &
         pids+=($!)
     done
     
@@ -118,9 +127,14 @@ build_all_parallel() {
 build_cluster() {
     local mode=${1:-"all"}
     local parallel=${2:-"yes"}
+    local debug_mode=${3:-"no"}  # Default: "no" = Release mode, "yes" = Debug mode
     
     log_info "Starting Motor build on cluster..."
-    log_info "Mode: $mode, Parallel: $parallel"
+    if [ "$debug_mode" == "yes" ]; then
+        log_info "Mode: $mode, Parallel: $parallel, Build Type: DEBUG (with -g -O0)"
+    else
+        log_info "Mode: $mode, Parallel: $parallel, Build Type: RELEASE (with -O3)"
+    fi
     
     # Check connectivity to all nodes
     if [ "$mode" == "all" ] || [ "$mode" == "memory" ]; then
@@ -162,10 +176,10 @@ build_cluster() {
         log_info "Building memory nodes..."
         
         if [ "$parallel" == "yes" ]; then
-            build_all_parallel "server" "${MEMORY_NODES[@]}"
+            build_all_parallel "server" "$debug_mode" "${MEMORY_NODES[@]}"
         else
             for node in "${MEMORY_NODES[@]}"; do
-                build_on_node $node "server"
+                build_on_node $node "server" "$debug_mode"
             done
         fi
         
@@ -177,10 +191,10 @@ build_cluster() {
         log_info "Building compute nodes..."
         
         if [ "$parallel" == "yes" ]; then
-            build_all_parallel "client" "${COMPUTE_NODES[@]}"
+            build_all_parallel "client" "$debug_mode" "${COMPUTE_NODES[@]}"
         else
             for node in "${COMPUTE_NODES[@]}"; do
-                build_on_node $node "client"
+                build_on_node $node "client" "$debug_mode"
             done
         fi
         
@@ -220,18 +234,20 @@ usage() {
     echo "Usage: $0 [command] [options]"
     echo ""
     echo "Commands:"
-    echo "  build [mode] [parallel]  - Build Motor on cluster nodes"
+    echo "  build [mode] [parallel] [debug]  - Build Motor on cluster nodes"
     echo "    mode: all|memory|compute (default: all)"
     echo "    parallel: yes|no (default: yes)"
+    echo "    debug: yes|no (default: no) - Build in Debug mode with -g -O0"
     echo "  clean [mode]             - Clean build directories"
     echo "    mode: all|memory|compute (default: all)"
     echo "  help                     - Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0 build                 # Build all nodes in parallel"
-    echo "  $0 build all no          # Build all nodes sequentially"
-    echo "  $0 build memory          # Build only memory nodes"
-    echo "  $0 build compute         # Build only compute nodes"
+    echo "  $0 build                 # Build all nodes in parallel (Release)"
+    echo "  $0 build all yes yes     # Build all nodes in parallel (Debug)"
+    echo "  $0 build all no          # Build all nodes sequentially (Release)"
+    echo "  $0 build memory          # Build only memory nodes (Release)"
+    echo "  $0 build compute yes yes # Build only compute nodes in parallel (Debug)"
     echo "  $0 clean                 # Clean all nodes"
     echo "  $0 clean memory          # Clean only memory nodes"
 }
@@ -240,7 +256,7 @@ usage() {
 main() {
     case "${1:-build}" in
         "build")
-            build_cluster "${2:-all}" "${3:-yes}"
+            build_cluster "${2:-all}" "${3:-yes}" "${4:-no}"
             ;;
         "clean")
             clean_cluster "${2:-all}"

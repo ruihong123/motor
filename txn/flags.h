@@ -33,7 +33,7 @@
 /*********************** Some limits, change them as needed **********************/
 #define MAX_REMOTE_NODE_NUM 100  
 #define MAX_TNUM_PER_CN 100
-#define MAX_CLIENT_NUM_PER_MN 64  // Must be ≥ max_client_num_per_mn in mn_config.json
+#define MAX_CLIENT_NUM_PER_MN 72  // Must be ≥ max_client_num_per_mn in mn_config.json
 #define BACKUP_NUM 2  // Backup memory node number. **NOT** 0
 
 #define MAX_DB_TABLE_NUM 15 

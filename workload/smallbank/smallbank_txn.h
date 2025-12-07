@@ -50,4 +50,15 @@ bool TxWriteCheck(SmallBank* smallbank_client,
                   coro_yield_t& yield,
                   tx_id_t tx_id,
                   TXN* txn);
+
+// Long-running scan transaction for hot table scanner
+// Scans multiple accounts from savings and checking tables
+bool TxHotTableScan(SmallBank* smallbank_client,
+                    coro_yield_t& yield,
+                    tx_id_t tx_id,
+                    TXN* txn,
+                    uint64_t& current_user_start,
+                    uint64_t& current_user,
+                    int& scan_table,
+                    bool& in_scan);
 /******************** The business logic (Transaction) end ********************/

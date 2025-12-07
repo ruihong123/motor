@@ -50,4 +50,18 @@ bool TxStockLevel(TPCC* tpcc_client,
                   tx_id_t tx_id,
                   TXN* txn);
 
+// Long-running scan transaction for hot table scanner
+// Scans multiple warehouses, districts, customers, and stock items
+bool TxHotTableScan(TPCC* tpcc_client,
+                    coro_yield_t& yield,
+                    tx_id_t tx_id,
+                    TXN* txn,
+                    int& current_warehouse_start,
+                    int& current_warehouse,
+                    int& current_district,
+                    int& current_customer,
+                    int& current_item,
+                    int& scan_phase,
+                    bool& in_scan);
+
 /******************** The business logic (Transaction) end ********************/

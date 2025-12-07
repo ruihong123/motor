@@ -19,7 +19,7 @@ do
       BUILD_TARGET="server";
       ;;
     d)
-      BUILD_TYPE=Release;
+      BUILD_TYPE=Debug;
       ;;
     ?)
       echo "unkonw argument"

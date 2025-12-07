@@ -5,6 +5,8 @@
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 
 #include <thread>
 
@@ -425,6 +427,9 @@ void Server::SendHashMeta(char* hash_meta_buffer, size_t& total_meta_size) {
   // The port can be used immediately after restart
   int on = 1;
   setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  #ifdef SO_REUSEPORT
+  setsockopt(listen_socket, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+  #endif
 
   if (listen_socket < 0) {
     RDMA_LOG(ERROR) << "Server creates socket error: " << strerror(errno);
@@ -464,26 +469,61 @@ void Server::SendHashMeta(char* hash_meta_buffer, size_t& total_meta_size) {
   RDMA_LOG(INFO) << "Server: About to send hash metadata, size: " << total_meta_size << " bytes (" 
                  << (double)total_meta_size / 1024 / 1024 << " MB)";
   
-  auto retlen = send(from_client_socket, hash_meta_buffer, total_meta_size, 0);
-  
-  if (retlen < 0) {
-    RDMA_LOG(ERROR) << "Server sends hash meta error: " << strerror(errno);
-    RDMA_LOG(ERROR) << "  Error code: " << errno;
-    RDMA_LOG(ERROR) << "  Expected to send: " << total_meta_size << " bytes";
-    RDMA_LOG(ERROR) << "  Actual return value: " << retlen;
-    close(from_client_socket);
-    close(listen_socket);
-    return;
+  // Loop to ensure all data is sent (send() may not send all bytes in one call)
+  size_t total_sent = 0;
+  while (total_sent < total_meta_size) {
+    ssize_t retlen = send(from_client_socket, hash_meta_buffer + total_sent, total_meta_size - total_sent, 0);
+    
+    if (retlen < 0) {
+      int error = errno;
+      RDMA_LOG(ERROR) << "Server sends hash meta error: " << strerror(error);
+      RDMA_LOG(ERROR) << "  Error code: " << error;
+      RDMA_LOG(ERROR) << "  Expected to send: " << total_meta_size << " bytes";
+      RDMA_LOG(ERROR) << "  Already sent: " << total_sent << " bytes";
+      RDMA_LOG(ERROR) << "  Actual return value: " << retlen;
+      close(from_client_socket);
+      close(listen_socket);
+      return;
+    }
+    
+    total_sent += retlen;
+    if (retlen > 0) {
+      RDMA_LOG(DBG) << "Server: Sent " << retlen << " bytes, total sent: " << total_sent << " / " << total_meta_size;
+    }
   }
-  RDMA_LOG(INFO) << "Server sends hash meta success: sent " << retlen << " bytes (expected " << total_meta_size << " bytes)";
+  RDMA_LOG(INFO) << "Server sends hash meta success: sent all " << total_sent << " bytes";
 
   size_t recv_ack_size = 100;
   char* recv_buf = (char*)malloc(recv_ack_size);
-  recv(from_client_socket, recv_buf, recv_ack_size, 0);
+  memset(recv_buf, 0, recv_ack_size);  // Initialize buffer
+  
+  // Receive ACK (should be small, but handle partial receive just in case)
+  size_t ack_received = 0;
+  size_t expected_ack_size = strlen("[ACK]hash_meta_received_from_client") + 1;
+  while (ack_received < expected_ack_size && ack_received < recv_ack_size) {
+    ssize_t retlen = recv(from_client_socket, recv_buf + ack_received, recv_ack_size - ack_received, 0);
+    if (retlen < 0) {
+      RDMA_LOG(ERROR) << "Server receives ACK error: " << strerror(errno);
+      free(recv_buf);
+      close(from_client_socket);
+      close(listen_socket);
+      return;
+    } else if (retlen == 0) {
+      RDMA_LOG(ERROR) << "Server: Connection closed by client before receiving ACK";
+      free(recv_buf);
+      close(from_client_socket);
+      close(listen_socket);
+      return;
+    } else {
+      ack_received += retlen;
+    }
+  }
 
   if (strcmp(recv_buf, "[ACK]hash_meta_received_from_client") != 0) {
     std::string ack(recv_buf);
-    RDMA_LOG(ERROR) << "Client receives hash meta error. Received ack is: " << ack;
+    RDMA_LOG(ERROR) << "Server: Invalid ACK received. Expected '[ACK]hash_meta_received_from_client', got: " << ack;
+  } else {
+    RDMA_LOG(DBG) << "Server: Received ACK from client";
   }
 
   free(recv_buf);
@@ -501,6 +541,9 @@ void Server::AcceptReq() {
   // The port can be used immediately after restart
   int on = 1;
   setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  #ifdef SO_REUSEPORT
+  setsockopt(listen_socket, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+  #endif
 
   if (listen_socket < 0) {
     RDMA_LOG(ERROR) << "Server creates socket error: " << strerror(errno);

@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <vector>
 
 #include "allocator/buffer_allocator.h"
@@ -22,6 +23,8 @@
 #include "util/json_config.h"
 #include "util/latency.h"
 #include "util/zipf.h"
+#include <thread>
+#include <atomic>
 
 using namespace std::placeholders;
 
@@ -101,6 +104,14 @@ __thread uint64_t write_ratio;
 // Stat the commit rate
 __thread uint64_t* thread_local_try_times;
 __thread uint64_t* thread_local_commit_times;
+
+// Hot table scanner configuration and statistics
+// Note: enable_hot_scan is now determined by hot_scan_thread_num > 0 in gen_output.cc
+std::atomic<uint64_t> hot_scan_committed_total(0);
+std::atomic<uint64_t> hot_scan_aborted_total(0);
+std::atomic<bool> hot_scan_should_run(false);
+std::atomic<int> hot_scan_threads_started(0);
+std::atomic<int> hot_scan_threads_ready(0);
 /////////////////////////////////////////////////////////
 
 // Coroutine 0 in each thread does polling
@@ -136,6 +147,17 @@ void RecordTpLat(double msr_sec) {
     // across all txn types (i.e., i) in the current workload
     total_try_times[i] += thread_local_try_times[i];
     total_commit_times[i] += thread_local_commit_times[i];
+  }
+  
+  // Report hot table scanner statistics if enabled (global stats)
+  uint64_t hot_scan_committed = hot_scan_committed_total.load();
+  uint64_t hot_scan_aborted = hot_scan_aborted_total.load();
+  if ((hot_scan_committed > 0 || hot_scan_aborted > 0)) {
+    double hot_scan_tput = (double)(hot_scan_committed + hot_scan_aborted) / msr_sec;
+    double hot_scan_abort_rate = hot_scan_aborted * 1.0 / (hot_scan_committed + hot_scan_aborted + 1);
+    printf("Hot Table Scanner (global): %lu committed, %lu aborted, throughput: %.2f K tps, abort rate: %.2f%%\n",
+           hot_scan_committed, hot_scan_aborted, hot_scan_tput, hot_scan_abort_rate * 100);
+    fflush(stdout);
   }
 
   mux.unlock();
@@ -237,6 +259,129 @@ void RunTATP(coro_yield_t& yield, coro_id_t coro_id) {
   }
 
   delete txn;
+}
+
+// Hot table scanner thread function - runs long-running scan transactions in a dedicated thread
+void HotTableScannerThread(std::string bench_name,
+                           TATP* tatp_cli,
+                           SmallBank* smallbank_cli,
+                           TPCC* tpcc_cli,
+                           MetaManager* meta_man,
+                           t_id_t thread_gid,
+                           LocalBufferAllocator* rdma_buffer_allocator,
+                           RemoteDeltaOffsetAllocator* delta_offset_allocator,
+                           LockedKeyTable* locked_key_table,
+                           AddrCache* addr_cache) {
+  // Create a QPManager for this dedicated thread
+  // The thread_gid is already set to a unique ID by gen_output.cc
+  t_id_t scanner_thread_id = thread_gid;
+  QPManager* scanner_qp_man = new QPManager(scanner_thread_id);
+  
+  // Wait for all worker threads to build their connections first
+  // This ensures the scanner thread's connection doesn't interfere
+  while (connected_t_num.load() < 1) {
+    std::this_thread::yield();
+  }
+  
+  scanner_qp_man->BuildQPConnection(meta_man);
+  
+  // Signal that this scanner thread is ready
+  hot_scan_threads_ready.fetch_add(1, std::memory_order_relaxed);
+  
+  // Create a coroutine scheduler for this dedicated thread
+  const coro_id_t scanner_coro_num = 2;  // Poll + 1 scanner coroutine
+  CoroutineScheduler* scanner_coro_sched = new CoroutineScheduler(scanner_thread_id, scanner_coro_num, meta_man->local_machine_id);
+  
+  // State variables for scan transactions (persist across transactions)
+  int current_warehouse_start = 1;
+  int current_warehouse = 1;
+  int current_district = 1;
+  int current_customer = 1;
+  int current_item = 1;
+  int scan_phase = 0;
+  bool in_scan = false;
+  
+  uint32_t current_user_start = 0;
+  uint32_t current_user = 0;
+  uint8_t current_ai_type = 1;
+  uint8_t current_sf_type = 1;
+  int scan_table = 0;
+  
+  uint64_t current_user_start_sb = 0;
+  uint64_t current_user_sb = 0;
+  int scan_table_sb = 0;
+  
+  // Initialize poll coroutine
+  scanner_coro_sched->coro_array[0].coro_id = 0;
+  scanner_coro_sched->coro_array[0].func = coro_call_t([&](coro_yield_t& yield) {
+    while (hot_scan_should_run.load(std::memory_order_acquire)) {
+      scanner_coro_sched->PollCompletion(scanner_thread_id);
+      Coroutine* next = scanner_coro_sched->coro_head->next_coro;
+      if (next->coro_id != 0) {
+        scanner_coro_sched->RunCoroutine(yield, next);
+      }
+    }
+  });
+  
+  // Initialize scanner coroutine
+  scanner_coro_sched->coro_array[1].coro_id = 1;
+  scanner_coro_sched->coro_array[1].func = coro_call_t([&](coro_yield_t& yield) {
+    // Create a TXN for this scanner thread
+    TXN* txn = new TXN(meta_man,
+                       scanner_qp_man,
+                       scanner_thread_id,
+                       1,  // coro_id = 1 (0 is poll)
+                       scanner_coro_sched,
+                       rdma_buffer_allocator,
+                       delta_offset_allocator,
+                       locked_key_table,
+                       addr_cache);
+    
+    while (hot_scan_should_run.load(std::memory_order_acquire)) {
+      uint64_t iter = ++tx_id_generator;
+      bool tx_committed = false;
+      
+      if (bench_name == "tpcc") {
+        tx_committed = TxHotTableScan(tpcc_cli, yield, iter, txn,
+                                      current_warehouse_start, current_warehouse,
+                                      current_district, current_customer,
+                                      current_item, scan_phase, in_scan);
+      } else if (bench_name == "tatp") {
+        tx_committed = TxHotTableScan(tatp_cli, yield, iter, txn,
+                                      current_user_start, current_user,
+                                      current_ai_type, current_sf_type,
+                                      scan_table, in_scan);
+      } else if (bench_name == "smallbank") {
+        tx_committed = TxHotTableScan(smallbank_cli, yield, iter, txn,
+                                      current_user_start_sb, current_user_sb,
+                                      scan_table_sb, in_scan);
+      }
+      
+      if (tx_committed) {
+        hot_scan_committed_total.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        hot_scan_aborted_total.fetch_add(1, std::memory_order_relaxed);
+      }
+      
+      // Yield to poll coroutine
+      scanner_coro_sched->Yield(yield, 1);
+    }
+    
+    delete txn;
+  });
+  
+  scanner_coro_sched->LoopLinkCoroutine(scanner_coro_num);
+  
+  // Wait for benchmark to start
+  while (!hot_scan_should_run.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  
+  // Start the scanner coroutine
+  scanner_coro_sched->coro_array[0].func();
+  
+  delete scanner_coro_sched;
+  delete scanner_qp_man;
 }
 
 void RunSmallBank(coro_yield_t& yield, coro_id_t coro_id) {
@@ -618,6 +763,9 @@ void run_thread(thread_params* params,
   // Guarantee that each thread has a global different initial seed
   seed = 0xdeadbeef + thread_gid;
 
+  // Hot table scanner threads are now created separately in gen_output.cc
+  // No need to create them here in worker threads
+
   // Init coroutines
   for (coro_id_t coro_i = 0; coro_i < coro_num; coro_i++) {
     uint64_t coro_seed = static_cast<uint64_t>((static_cast<uint64_t>(thread_gid) << 32) | static_cast<uint64_t>(coro_i));
@@ -678,7 +826,11 @@ void run_thread(thread_params* params,
       // Create server socket
       int server_socket = socket(AF_INET, SOCK_STREAM, 0);
       int on = 1;
+      // Enable port reuse to allow immediate rebinding after restart
       setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+      #ifdef SO_REUSEPORT
+      setsockopt(server_socket, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+      #endif
       
       struct sockaddr_in server_addr;
       server_addr.sin_family = AF_INET;
@@ -860,6 +1012,17 @@ void run_thread(thread_params* params,
     usleep(100);
   }
 
+  // Start hot table scanner threads if enabled (signal from thread 0)
+  // Hot table scanner threads are created separately in gen_output.cc
+  if (thread_local_id == 0) {
+    // Wait for all normal transaction threads to be ready
+    while (connected_t_num.load() < params->running_tnum) {
+      usleep(100);
+    }
+    // Signal hot table scanner threads to start
+    hot_scan_should_run.store(true, std::memory_order_release);
+  }
+
   // Start the first coroutine
   coro_sched->coro_array[0].func();
 
@@ -961,6 +1124,9 @@ void recovery(thread_params* params,
   // Guarantee that each thread has a global different initial seed
   seed = 0xdeadbeef + thread_gid;
 
+  // Hot table scanner threads are now created separately in gen_output.cc
+  // No need to create them here in recovery worker threads
+
   // Init coroutines
   for (coro_id_t coro_i = 0; coro_i < coro_num; coro_i++) {
     uint64_t coro_seed = static_cast<uint64_t>((static_cast<uint64_t>(thread_gid) << 32) | static_cast<uint64_t>(coro_i));
@@ -1054,6 +1220,17 @@ void recovery(thread_params* params,
     printf("release lock at :%s %ld:%ld\r\n", output, tv_ms, tv_us);
   }
 #endif
+
+  // Start hot table scanner threads if enabled (signal from thread 0)
+  // Hot table scanner threads are created separately in gen_output.cc
+  if (thread_local_id == 0) {
+    // Wait for all recovery threads to be ready
+    while (connected_recovery_t_num.load() < params->running_tnum) {
+      usleep(100);
+    }
+    // Signal hot table scanner threads to start
+    hot_scan_should_run.store(true, std::memory_order_release);
+  }
 
   coro_sched->coro_array[0].func();
 

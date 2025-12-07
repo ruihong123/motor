@@ -154,31 +154,96 @@ node_id_t MetaManager::GetMemStoreMeta(std::string& remote_ip, int remote_port) 
   size_t hash_meta_size = (size_t)1024 * 1024 * 10;
   char* recv_buf = (char*)malloc(hash_meta_size);
 
-  auto retlen = recv(client_socket, recv_buf, hash_meta_size, 0);
-  if (retlen < 0) {
-      int error = errno;
-    RDMA_LOG(ERROR) << "MetaManager receives hash meta error from " << remote_ip << ":" << remote_port;
-    RDMA_LOG(ERROR) << "  Error code: " << error << " (" << strerror(error) << ")";
-    RDMA_LOG(ERROR) << "  Expected buffer size: " << hash_meta_size << " bytes";
-    RDMA_LOG(ERROR) << "  Actual return value: " << retlen;
+  // First, receive the header to determine the expected total size
+  size_t header_size = sizeof(size_t) * 2 + sizeof(node_id_t) + sizeof(offset_t) + sizeof(size_t);
+  size_t total_received = 0;
+  
+  // Receive header first
+  while (total_received < header_size) {
+    ssize_t retlen = recv(client_socket, recv_buf + total_received, header_size - total_received, 0);
     
-    free(recv_buf);
-    close(client_socket);
-    abort();
-  } else if (retlen == 0) {
-    RDMA_LOG(ERROR) << "MetaManager: Connection closed by remote " << remote_ip << ":" << remote_port 
-                    << " before receiving hash metadata";
-    RDMA_LOG(ERROR) << "  This usually means the memory node crashed or closed the connection prematurely";
-    free(recv_buf);
-    close(client_socket);
-    abort();
-  } else {
-    RDMA_LOG(INFO) << "MetaManager: Successfully received " << retlen << " bytes of hash metadata from " 
-                   << remote_ip << ":" << remote_port;
+    if (retlen < 0) {
+      int error = errno;
+      RDMA_LOG(ERROR) << "MetaManager receives hash meta header error from " << remote_ip << ":" << remote_port;
+      RDMA_LOG(ERROR) << "  Error code: " << error << " (" << strerror(error) << ")";
+      RDMA_LOG(ERROR) << "  Already received: " << total_received << " bytes";
+      free(recv_buf);
+      close(client_socket);
+      abort();
+    } else if (retlen == 0) {
+      RDMA_LOG(ERROR) << "MetaManager: Connection closed by remote " << remote_ip << ":" << remote_port 
+                      << " before receiving header (only " << total_received << " bytes received)";
+      free(recv_buf);
+      close(client_socket);
+      abort();
+    } else {
+      total_received += retlen;
+    }
   }
+  
+  // Parse header to calculate expected total size
+  char* header_parser = recv_buf;
+  size_t header_primary_meta_num = *((size_t*)header_parser);
+  header_parser += sizeof(header_primary_meta_num);
+  size_t header_backup_meta_num = *((size_t*)header_parser);
+  
+  size_t expected_total = header_size +
+                          header_primary_meta_num * sizeof(HashMeta) +
+                          header_backup_meta_num * sizeof(HashMeta) +
+                          sizeof(uint64_t); // EOF marker
+  
+  if (expected_total > hash_meta_size) {
+    RDMA_LOG(ERROR) << "MetaManager: Expected metadata size " << expected_total 
+                    << " exceeds buffer size " << hash_meta_size;
+    free(recv_buf);
+    close(client_socket);
+    abort();
+  }
+  
+  // Now receive the rest of the data
+  while (total_received < expected_total) {
+    ssize_t retlen = recv(client_socket, recv_buf + total_received, expected_total - total_received, 0);
+    
+    if (retlen < 0) {
+      int error = errno;
+      RDMA_LOG(ERROR) << "MetaManager receives hash meta error from " << remote_ip << ":" << remote_port;
+      RDMA_LOG(ERROR) << "  Error code: " << error << " (" << strerror(error) << ")";
+      RDMA_LOG(ERROR) << "  Expected total: " << expected_total << " bytes";
+      RDMA_LOG(ERROR) << "  Already received: " << total_received << " bytes";
+      free(recv_buf);
+      close(client_socket);
+      abort();
+    } else if (retlen == 0) {
+      RDMA_LOG(ERROR) << "MetaManager: Connection closed by remote " << remote_ip << ":" << remote_port 
+                      << " before receiving all data (expected " << expected_total 
+                      << " bytes, received " << total_received << " bytes)";
+      free(recv_buf);
+      close(client_socket);
+      abort();
+    } else {
+      total_received += retlen;
+      RDMA_LOG(DBG) << "MetaManager: Received " << retlen << " bytes, total received: " << total_received << " / " << expected_total;
+    }
+  }
+  
+  RDMA_LOG(INFO) << "MetaManager: Successfully received " << total_received << " bytes of hash metadata from " 
+                 << remote_ip << ":" << remote_port;
 
+  // Send ACK to server (handle partial sends)
   char ack[] = "[ACK]hash_meta_received_from_client";
-  send(client_socket, ack, strlen(ack) + 1, 0);
+  size_t ack_len = strlen(ack) + 1;
+  size_t ack_sent = 0;
+  while (ack_sent < ack_len) {
+    ssize_t retlen = send(client_socket, ack + ack_sent, ack_len - ack_sent, 0);
+    if (retlen < 0) {
+      RDMA_LOG(ERROR) << "MetaManager: Failed to send ACK to " << remote_ip << ":" << remote_port 
+                      << " - " << strerror(errno);
+      free(recv_buf);
+      close(client_socket);
+      abort();
+    }
+    ack_sent += retlen;
+  }
 
   close(client_socket);
 

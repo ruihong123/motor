@@ -10,7 +10,9 @@
     "crash_tnum": 20,
     "crash_time_ms": 3000,
     "tp_probe_interval_ms": 1,
-    "barrier_port": 23456
+    "barrier_port": 23456,
+    "hot_scan_thread_num": 1,
+    "comment_hot_scan": "Number of dedicated hot table scanner threads (0 = disabled, 1+ = enabled with that many threads)"
   },
   "compute_nodes": {
     "compute_ips": [

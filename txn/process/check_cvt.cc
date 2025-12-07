@@ -99,6 +99,7 @@ bool TXN::CheckCasReadCVT(std::vector<CasRead>& pending_cas_rw,
           local_item->is_delete_all_invalid = true;
           local_item->is_delete_no_read_value = true;
           local_item->header = fetched_cvt->header;
+          local_item->target_write_pos = 0;  // Set to valid value even though it won't be used
           continue;
         }
 
@@ -242,6 +243,7 @@ int TXN::FindMatch(HashRead& res,
         local_item->is_delete_all_invalid = true;
         local_item->is_delete_no_read_value = true;
         local_item->header = fetched_cvt->header;
+        local_item->target_write_pos = 0;  // Set to valid value even though it won't be used
         return slot_idx;
       }
 
