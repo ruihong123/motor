@@ -39,7 +39,7 @@ COROUTINE_COUNTS=(2)
 ISOLATION_LEVELS=("SR")
 
 # Hot table scanner thread counts to test (0 = disabled, 1+ = enabled with that many threads)
-HOT_SCAN_THREAD_COUNTS=(0 1)
+HOT_SCAN_THREAD_COUNTS=(1)
 
 # Debug mode (yes/no) - builds with -g -O0 flags
 DEBUG_MODE="no"

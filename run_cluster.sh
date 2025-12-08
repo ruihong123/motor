@@ -85,9 +85,47 @@ stop_memory_nodes() {
     log_info "Stopping all memory nodes..."
     for node in "${MEMORY_NODES[@]}"; do
         log_info "Stopping memory node on $node..."
-        ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "sudo pkill -f motor_mempool" || true
+        
+        # First, try graceful shutdown with SIGTERM
+        ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "
+            sudo pkill -TERM -f motor_mempool 2>/dev/null || true
+        " || true
+        
+        # Wait a bit for graceful shutdown
+        sleep 2
+        
+        # Check if processes are still running
+        if ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 $USERNAME@$node "pgrep -f motor_mempool" >/dev/null 2>&1; then
+            log_warning "Memory node $node still has processes running after SIGTERM, using aggressive kill..."
+            # Only use strict measures if first attempt failed
+            ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "
+                # Force kill with SIGKILL
+                sudo pkill -KILL -f motor_mempool 2>/dev/null || true
+                # Also try killall as backup
+                sudo killall -9 motor_mempool 2>/dev/null || true
+                # Kill by process name pattern (more aggressive)
+                for pid in \$(pgrep -f motor_mempool 2>/dev/null); do
+                    sudo kill -9 \$pid 2>/dev/null || true
+                done
+            " || true
+            
+            # Verify again after aggressive kill
+            sleep 1
+            if ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 $USERNAME@$node "pgrep -f motor_mempool" >/dev/null 2>&1; then
+                log_error "Memory node $node still has processes running after aggressive kill!"
+            fi
+        fi
     done
+    
     log_success "All memory nodes stopped"
+}
+
+# Function to check if benchmark process is running (specific pattern matching)
+check_benchmark_running() {
+    local node=$1
+    # Match ./run followed by a workload name (tpcc, tatp, smallbank, micro)
+    ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 $USERNAME@$node \
+        "pgrep -f './run (tpcc|tatp|smallbank|micro) ' >/dev/null 2>&1"
 }
 
 # Function to stop all compute nodes
@@ -95,7 +133,34 @@ stop_compute_nodes() {
     log_info "Stopping all compute nodes..."
     for node in "${COMPUTE_NODES[@]}"; do
         log_info "Stopping compute node on $node..."
-        ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "sudo pkill -f './run ' || true" || true
+        
+        # First, try graceful shutdown with SIGTERM (using specific pattern)
+        ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "
+            sudo pkill -TERM -f './run (tpcc|tatp|smallbank|micro) ' 2>/dev/null || true
+        " || true
+        
+        # Wait a bit for graceful shutdown
+        sleep 2
+        
+        # Check if benchmark processes are still running (using specific pattern)
+        if check_benchmark_running $node; then
+            log_warning "Compute node $node still has benchmark processes running after SIGTERM, using aggressive kill..."
+            # Only use strict measures if first attempt failed
+            ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 $USERNAME@$node "
+                # Force kill with SIGKILL (using specific pattern)
+                sudo pkill -KILL -f './run (tpcc|tatp|smallbank|micro) ' 2>/dev/null || true
+                # Kill by process name pattern (more aggressive, but still specific)
+                for pid in \$(pgrep -f './run (tpcc|tatp|smallbank|micro) ' 2>/dev/null); do
+                    sudo kill -9 \$pid 2>/dev/null || true
+                done
+            " || true
+            
+            # Verify again after aggressive kill
+            sleep 1
+            if check_benchmark_running $node; then
+                log_error "Compute node $node still has benchmark processes running after aggressive kill!"
+            fi
+        fi
     done
     log_success "All compute nodes stopped"
 }
@@ -114,7 +179,7 @@ verify_all_nodes_stopped() {
     done
     
     for node in "${COMPUTE_NODES[@]}"; do
-        if ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 $USERNAME@$node "pgrep -f './run'" >/dev/null 2>&1; then
+        if check_benchmark_running $node; then
             log_warning "Compute node $node is still running"
             compute_running=$((compute_running + 1))
         fi
@@ -414,7 +479,7 @@ show_status() {
     log_info "=== Compute Nodes Status ==="
     local running_count=0
     for node in "${COMPUTE_NODES[@]}"; do
-        if ssh -o ConnectTimeout=10 $USERNAME@$node "pgrep -f './run' > /dev/null 2>&1"; then
+        if check_benchmark_running $node; then
             log_success "$node: Running benchmark"
             ((running_count++))
         else
